@@ -90,3 +90,31 @@ The trainer-supplied Open WebUI bundle is the chat client, run separately from t
 - `.env` is untracked; secrets are never committed.
 - The application must start with no database or model credentials and expose a safe `GET /healthz`.
 - Canonical environment values are defined in `.env.example`.
+
+## Corpus
+
+Section-level JSONL corpus produced from `data/raw/` PDFs by `scripts/extract_sections.py`. One JSON object per line, one record per section. No MongoDB, no embeddings, no vector indexes.
+
+### Parser
+
+- **Library**: `pymupdf` (fitz) 1.28.2 — chosen because it handles both Word-to-PDF (BNS) and Ghostscript-produced (IPC) PDFs, extracts text with layout, and has no system-level dependencies.
+- **Extraction command**: `uv run python scripts/extract_sections.py`
+
+### Output format
+
+JSONL files at `data/processed/`:
+
+| File | Records | Sections |
+|---|---|---|
+| `data/processed/bns_sections.jsonl` | 358 | 1–358 |
+| `data/processed/ipc_sections.jsonl` | 500 | 1–511 (11 unextractable) |
+
+Each record has 14 fields: `section_id`, `act`, `act_label`, `status`, `chapter`, `chapter_title`, `section_number`, `heading`, `text`, `source_pdf`, `source_sha256`, `parser`, `parser_version`, `source_status_version`, `needs_review`.
+
+### Known limitations
+
+- **IPC PDF quality**: 11 sections (4, 5, 18, 34, 40, 75, 161, 162, 163, 164, 165) have no extractable text from the scanned/Ghostscript-produced PDF. Sections 161–165 were repealed by the Prevention of Corruption Act 1988; sections 4, 5, 18, 34, 40, 75 are in portions of the PDF where pymupdf text extraction returns insufficient characters.
+- **IPC section headings**: Some IPC sections (e.g. 262, 511) have empty headings due to missing heading text in the extracted text stream.
+- **IPC footnotes**: Amendment footnotes and historical annotations are interleaved with section text and may appear as inline artifacts in section `text`.
+- **BNS chapter markers**: Chapter boundaries are detected from `CHAPTER <roman>` lines in the body text. The BNS index (pages 2–19) provides section headings; the correspondence table (pages 20–73) is skipped.
+- **Source-hash safety rule**: If a source PDF hash changes, the corpus for that act is regenerated as an atomic replacement. Records from different PDF versions are never mixed in one corpus file.
