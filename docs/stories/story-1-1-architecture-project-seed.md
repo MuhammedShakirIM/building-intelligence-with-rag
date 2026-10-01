@@ -117,7 +117,7 @@ The pre-provisioned Pipe sends the selected `rag-<pattern>` model, `stream: true
 - App starts with no database or model credentials; `GET /healthz` returns success.
 - One diagnostic placeholder request to `POST /v1/query` returns honest `not_implemented` per mode.
 - `GET /v1/models` lists the six model IDs.
-- `POST /v1/chat/completions` returns both JSON and SSE placeholder responses with proper `.
+- `POST /v1/chat/completions` returns both JSON and SSE placeholder responses with proper `[DONE]` framing.
 - Smoke check (document in the story): start the capstone API, open `http://127.0.0.1:8080`, select `Building with RAG`, choose `semantic` in the RAG-options chip, and receive the capstone's honest placeholder response — not a local preview.
 - Ruff passes; the minimal test runner passes.
 
