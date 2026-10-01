@@ -118,3 +118,49 @@ Each record has 14 fields: `section_id`, `act`, `act_label`, `status`, `chapter`
 - **IPC footnotes**: Amendment footnotes and historical annotations are interleaved with section text and may appear as inline artifacts in section `text`.
 - **BNS chapter markers**: Chapter boundaries are detected from `CHAPTER <roman>` lines in the body text. The BNS index (pages 2–19) provides section headings; the correspondence table (pages 20–73) is skipped.
 - **Source-hash safety rule**: If a source PDF hash changes, the corpus for that act is regenerated as an atomic replacement. Records from different PDF versions are never mixed in one corpus file.
+
+## MongoDB collections (Story 2.2)
+
+Four collections in `building_with_rag` (or `building_with_rag_test` when `APP_ENV=testing`):
+
+| Collection | Role | Key fields |
+|---|---|---|
+| `sources` | One record per source act PDF | `_id` (`bns_source`/`ipc_source`), `act`, `source_sha256`, `section_count` |
+| `sections` | One record per section (858 total) | `_id` = `section_id`, `act`, `section_number`, `text`, `source_id` |
+| `chunks` | Overlapping chunks of section text | `_id` = deterministic chunk ID, `section_id`, `chunk_index`, `text`, `embedding_input` |
+| `embeddings` | One 1,024-dimension vector per chunk | `_id` = deterministic embedding ID, `chunk_id`, `vector`, `model`, `dimensions` |
+
+### Chunking
+
+- **Library**: `langchain_text_splitters.RecursiveCharacterTextSplitter`
+- **Parameters**: `chunk_size=2048`, `chunk_overlap=256`, separators `["\n\n", "\n", ". ", " ", ""]`
+- **`chunking_version`**: `v1` — bump when chunking logic or embedding model changes to force re-chunking
+- **`embedding_input`**: prepends `[{act_label}] {heading}\n` to chunk text for better retrieval quality
+- Chunks never span sections or acts.
+
+### Embedding
+
+- **Model**: `voyage-3.5`, 1,024 dimensions, cosine similarity
+- **Deterministic embedding ID**: `sha256(f"emb:{chunk_id}:{model}:{model_version}:{dimensions}")[:24]`
+- **Rate limiting**: 0.2s delay between API calls; retry on 429
+
+### Vector index
+
+- **Name**: `vector_index`
+- **Type**: `vectorSearch` (Atlas Search)
+- **Definition**: `knnVector` on `vector` field, 1,024 dimensions, cosine similarity; `token` fields for `act`, `status`, `access_level`, `chapter` to support `$vectorSearch` filter clauses
+- **Creation**: `createSearchIndexes` command; waits up to 60s for `READY`
+- **Safe re-run**: skips if compatible index exists; errors if incompatible; creates if absent
+
+### Ingestion command
+
+```bash
+uv run python -m building_with_rag.ingestion.ingest
+```
+
+### Limitations
+
+- MongoDB Community Edition unsupported — requires Atlas (M0+ free tier) or Enterprise with Atlas Search
+- Single `access_level` (`public`) — no multi-tenant filtering
+- No incremental partial updates — re-ingest replaces changed records, cleans up orphans
+- Vector index must be dropped manually in Atlas UI to change dimensions or similarity
