@@ -132,7 +132,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 
 Expected: 400 with `"code":"missing_user_message"`.
 
-## Story 1.2 — Document Ingestion
+## Story 2.1 — Document Ingestion
 
 What it adds: PDF extraction script that produces inspectable JSONL section-level corpora from the BNS and IPC bare act PDFs.
 

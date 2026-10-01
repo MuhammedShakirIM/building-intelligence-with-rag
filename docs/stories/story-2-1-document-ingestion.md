@@ -1,4 +1,4 @@
-# Story 1.2 — Document Ingestion
+# Story 2.1 — Document Ingestion
 
 Second story of the three-day "Building Intelligence with RAG" classroom course. Follows Story 1.1. Turns the supplied BNS and IPC PDFs into a small, inspectable section-level JSONL corpus. MongoDB, embeddings, vector indexes, retrieval, and answer generation belong to later stories.
 
