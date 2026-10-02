@@ -193,10 +193,6 @@ def run_semantic(request: QueryRequest) -> QueryResult:
         _ready = False
         raise _not_ready("Vector hits could not be resolved to chunks/sections; re-run ingestion.")
 
-    ignored = []
-    if request.generate_answer:
-        ignored.append("generate_answer accepted but no answer is generated in semantic mode "
-                       "(generation is null).")
     status = "ok" if results else "no_results"
     message = (f"Returned {len(results)} passage(s). " if results
                else "No passages match the filters. ") + SIMILARITY_NOTE
@@ -215,7 +211,6 @@ def run_semantic(request: QueryRequest) -> QueryResult:
             "filters": filters,
             "caller_id": settings.webui_demo_caller_id,
             "result_count": len(results),
-            "ignored": ignored,
             "unresolved_hits": unresolved,
         },
         results=results,

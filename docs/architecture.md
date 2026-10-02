@@ -42,7 +42,7 @@ One shared registry (single source of truth) holds only:
 | decomposition | `rag-decomposition` |
 | hyde | `rag-hyde` |
 
-`semantic` is real on `POST /v1/query` (Story 2.3); chat for `rag-semantic` and every other mode still return honest `not_implemented` placeholders until their own stories add behavior.
+`semantic` is real on `POST /v1/query` (Stories 2.3, 3.1 answer generation); chat for `rag-semantic` and every other mode still return honest `not_implemented` placeholders until their own stories add behavior.
 
 ## API contracts
 
@@ -170,7 +170,7 @@ Code: `src/building_with_rag/retrieval/semantic.py`, routed from `routes/query.p
 
 Flow: validate request → scope filters → embed question → `$vectorSearch` → resolve chunk/section → `QueryResult`.
 
-- Validation: question trimmed (non-empty); `limit` 1–20; `SemanticFilters` forbids unknown fields and accepts only known plain strings (`BNS_2023`/`IPC_1860`, `in_force`/`repealed`, `public`). `caller_id` must be omitted or equal `WEBUI_DEMO_CALLER_ID`; `required_acts` and `chapter` are rejected (422). `generate_answer` is accepted but nothing is generated (noted in `trace.ignored`).
+- Validation: question trimmed (non-empty); `limit` 1–20; `SemanticFilters` forbids unknown fields and accepts only known plain strings (`BNS_2023`/`IPC_1860`, `in_force`/`repealed`, `public`). `caller_id` must be omitted or equal `WEBUI_DEMO_CALLER_ID`; `required_acts` and `chapter` are rejected (422). `generate_answer` triggers Story 3.1 answer generation (see below).
 - Scope: server fixes `access_level=["public"]`; caller `act`/`status` lists only narrow it (`$in` inside the `$vectorSearch` `filter`).
 - Embedding: raw question, `voyage-3.5`, `input_type="query"`, vector length must be 1,024.
 - Search: `vector_index` on `embeddings`, `numCandidates = max(limit, min(200, max(50, 10*limit)))`. Score order kept; chunks (not sections) returned. Hits whose chunk/section can't be resolved are omitted and counted in `trace.unresolved_hits`.
@@ -185,3 +185,15 @@ curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
   -d '{"question": "What is the punishment for theft?", "pattern": "semantic", "limit": 3}' \
   | jq '{status, trace, results: [.results[] | {chunk_id, section_id, act, heading, score, text: .text[:80]}]}'
 ```
+
+## Context and answer boundaries (Story 3.1)
+
+Code: `src/building_with_rag/generation/{context,answer}.py`, called from `routes/query.py` only when `pattern: "semantic"` and `generate_answer: true`.
+
+Flow: semantic `QueryResult` → bounded labelled context (`E1`…; at most 5 passages / 12,000 chars, never cut mid-passage) → one `POST {GENERATION_API_BASE_URL}/chat/completions` (`temperature: 0`, 30 s timeout, no retries) → strict JSON parse → citations resolved from the supplied context only.
+
+- Outcomes (`generation.outcome`): `answered` (non-empty `text`, claims each citing supplied labels, resolved `citations`/`supporting_passages`), `insufficient_evidence` (also when context is empty; no model call), `unavailable` (missing settings, timeout, connection error, non-2xx), `malformed` (non-JSON, missing `choices`, unknown label, rule violation; no repair or retry).
+- Added optional `GenerationResult` fields: `outcome`, `claims`, `citations`, `supporting_passages`, `provider`, `trace`, `context_outcome` (existing `text`, `model` kept).
+- Evidence blocks are untrusted source text, never instructions. No claims of current legal applicability beyond the supplied BNS/IPC documents.
+- `unavailable` and `malformed` return HTTP 200 with retrieval `results` intact; `status` stays the retrieval status. Prompts, URL and key never appear in responses.
+- Chat (`rag-semantic` placeholder) and streaming are deferred to Story 3.2.
