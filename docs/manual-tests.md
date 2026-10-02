@@ -54,16 +54,6 @@ curl -s http://127.0.0.1:8000/v1/query \
 
 Expected: `"status":"ok"` with re-ranked results (real since Story 4.2; needs `RERANK_API_KEY`, else 503 `retrieval_not_ready`).
 
-### Query — structured
-
-```bash
-curl -s http://127.0.0.1:8000/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What is theft?", "pattern": "structured"}'
-```
-
-Expected: `"status":"not_implemented"`, message references `structured`.
-
 ### Query — decomposition
 
 ```bash
@@ -99,7 +89,7 @@ Expected: 422 validation error (question below min_length 1).
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "rag-structured", "messages": [{"role": "user", "content": "What is theft?"}]}'
+  -d '{"model": "rag-decomposition", "messages": [{"role": "user", "content": "What is theft?"}]}'
 ```
 
 Expected: `"object":"chat.completion"`, `"finish_reason":"stop"`, content contains `not implemented yet`.
@@ -109,7 +99,7 @@ Expected: `"object":"chat.completion"`, `"finish_reason":"stop"`, content contai
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "rag-structured", "messages": [{"role": "user", "content": "What is theft?"}], "stream": true}'
+  -d '{"model": "rag-decomposition", "messages": [{"role": "user", "content": "What is theft?"}], "stream": true}'
 ```
 
 Expected: SSE `data:` frames with `delta` role then content, ending with `data: [DONE]`.
@@ -267,7 +257,7 @@ Expected: index ends `chunk_text_index: READY (queryable)`; `status: ok`, ≤ `l
 
 Compare modes: run one paraphrased and one exact-term question with `"pattern":"semantic"` and `"hybrid"`, `generate_answer: true`, `limit: 5`; note section order, contributing route(s), and `generation.outcome`.
 
-Chat: `rag-hybrid` streams DRAFT, confidence and `Sources:` as `rag-semantic` does; `rag-structured` still returns `not implemented yet`.
+Chat: `rag-hybrid` streams DRAFT, confidence and `Sources:` as `rag-semantic` does; `rag-decomposition` still returns `not implemented yet`.
 
 Failure: with `chunk_text_index` missing, hybrid → 503 `retrieval_not_ready` (names the keyword-index command) while semantic stays `ok`.
 
@@ -292,3 +282,29 @@ Chat: `rag-hybrid-reranked` streams DRAFT, confidence and `Sources:`; cited chun
 Missing key: with `RERANK_API_KEY=` empty and the API restarted, `hybrid-reranked` → 503 `retrieval_not_ready` (query) / OpenAI-style error (chat); `hybrid` stays `ok`.
 
 Offline: `uv run pytest tests/test_rerank_retrieval.py tests/test_hybrid_retrieval.py`
+
+## Story 5.1 — Structured exact retrieval
+
+Postman: `POST http://127.0.0.1:8000/v1/query`, header `Content-Type: application/json`, Body → raw → JSON. Send each body below; check `status`, `trace.signals`, `trace.mongodb_called`, `trace.record`, `results`.
+
+| # | Body | Expected |
+|---|---|---|
+| 1 | `{"question": "What does BNS section 103 say?", "pattern": "structured"}` | `status: ok`; `results[0].section_id: bns:103`; `mongodb_called: true`; `trace.record` has `status`, `source_status_version` |
+| 2 | `{"question": "IPC section 302", "pattern": "structured"}` | `ok`; `ipc:302`; `mongodb_called: true` |
+| 3 | `{"question": "What does BNS section 103 say?", "pattern": "structured", "generate_answer": true}` | as #1, plus `generation.outcome` reported; `generation.citations` only `bns:103` |
+| 4 | `{"question": "What does section 103 say?", "pattern": "structured"}` | `clarification_needed`; `results: []`; `mongodb_called: false`; `trace.signals.reason` names missing act |
+| 5 | `{"question": "IPC section 4", "pattern": "structured"}` | HTTP 200; `not_found`; `results: []`; `mongodb_called: true` |
+| 6 | `{"question": "BNS section 999", "pattern": "structured"}` | same as #5 |
+| 7 | `{"question": "What is the punishment for theft?", "pattern": "structured"}` | `recommendation`; `mongodb_called: false` |
+
+Chat: `POST http://127.0.0.1:8000/v1/chat/completions`, same header, body `{"model": "rag-structured", "messages": [{"role": "user", "content": "What does BNS section 103 say?"}]}` (omit `stream` so Postman shows one JSON reply). `choices[0].message.content` shows DRAFT/confidence/`Sources:`. With content `What does section 103 say?` it is the clarification text only. If `CAPSTONE_API_KEY` is set, add `Authorization: Bearer <key>`.
+
+Optional compact view: in the request's **Scripts → Post-response** tab (Tests in older Postman) paste, then open the Console (View → Show Postman Console) instead of reading the full body:
+
+```js
+const b = pm.response.json();
+console.log(JSON.stringify({status: b.status, signals: b.trace.signals, mongodb_called: b.trace.mongodb_called,
+  record: b.trace.record, results: b.results.map(r => ({section_id: r.section_id, text: r.text.slice(0, 60)}))}));
+```
+
+Offline: `uv run pytest tests/test_structured_retrieval.py tests/test_smoke.py`

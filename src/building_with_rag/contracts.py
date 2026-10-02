@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from building_with_rag.ingestion import mongodb_schema as schema
 from building_with_rag.registry import Pattern
@@ -75,6 +75,26 @@ class RetrievedChunk(BaseModel):
     rerank_score: float | None = None
     rerank_rank: int | None = None
     omitted_reason: str | None = None
+
+
+class StructuredSignals(BaseModel):
+    """Validated output of the rule-based structured classifier (Story 5.1)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    intent: Literal["exact_lookup", "filter", "aggregation"] | None = None
+    act: Literal["BNS_2023", "IPC_1860"] | None = None
+    section_number: int | None = Field(default=None, ge=1, le=999)
+    chapter: str | None = None
+    status: Literal["ok", "recommendation", "clarification_needed"]
+    reason: str
+
+    @model_validator(mode="after")
+    def _ok_means_complete_lookup(self):
+        if self.status == "ok" and not (
+                self.intent == "exact_lookup" and self.act and self.section_number):
+            raise ValueError("status 'ok' requires an exact_lookup with act and section_number.")
+        return self
 
 
 class GenerationClaim(BaseModel):

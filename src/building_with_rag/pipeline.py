@@ -8,12 +8,15 @@ from building_with_rag.registry import Pattern, run_pattern
 from building_with_rag.retrieval.hybrid import run_hybrid
 from building_with_rag.retrieval.rerank import run_hybrid_reranked
 from building_with_rag.retrieval.semantic import QueryError, run_semantic
+from building_with_rag.retrieval.structured import run_structured
 
-__all__ = ["REAL_PATTERNS", "QueryError", "answer_events", "attach_generation", "retrieve"]
+__all__ = ["REAL_PATTERNS", "QueryError", "answer_events", "attach_generation", "has_answer_path",
+           "retrieve"]
 
 # Modes with real retrieval; they share one context -> generation -> validation path.
 REAL_PATTERNS = frozenset(
-    {Pattern.SEMANTIC.value, Pattern.HYBRID.value, Pattern.HYBRID_RERANKED.value})
+    {Pattern.SEMANTIC.value, Pattern.HYBRID.value, Pattern.HYBRID_RERANKED.value,
+     Pattern.STRUCTURED.value})
 
 _OUTCOME_NOTE = {
     "answered": "Answer generated from the cited passages.",
@@ -28,19 +31,28 @@ _LOW_CONFIDENCE_NOTE = (
 
 
 def retrieve(request: QueryRequest) -> QueryResult:
-    """Semantic, hybrid and hybrid-reranked run real retrieval; others use the placeholder."""
+    """Semantic, hybrid, hybrid-reranked and structured run real retrieval; others are placeholders."""
     if request.pattern is Pattern.SEMANTIC:
         return run_semantic(request)
     if request.pattern is Pattern.HYBRID:
         return run_hybrid(request)
     if request.pattern is Pattern.HYBRID_RERANKED:
         return run_hybrid_reranked(request)
+    if request.pattern is Pattern.STRUCTURED:
+        return run_structured(request)
     return QueryResult(**run_pattern(request.pattern, request.question, request.caller_id))
+
+
+def has_answer_path(retrieval: QueryResult) -> bool:
+    """Real modes answer; structured only when it found the exact record (status ok)."""
+    if retrieval.pattern == Pattern.STRUCTURED.value:
+        return retrieval.status == "ok"
+    return retrieval.pattern in REAL_PATTERNS
 
 
 def answer_events(question: str, retrieval: QueryResult) -> Iterator[Event]:
     """The single generation/validation operation; no events for placeholder modes."""
-    if retrieval.pattern in REAL_PATTERNS:
+    if has_answer_path(retrieval):
         yield from stream_answer(question, retrieval)
 
 

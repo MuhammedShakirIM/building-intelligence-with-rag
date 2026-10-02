@@ -22,7 +22,7 @@ from building_with_rag.contracts import (
     QueryResult,
     SemanticFilters,
 )
-from building_with_rag.pipeline import REAL_PATTERNS, QueryError, answer_events, retrieve
+from building_with_rag.pipeline import QueryError, answer_events, has_answer_path, retrieve
 from building_with_rag.registry import MODEL_ID_TO_PATTERN
 from building_with_rag.settings import get_settings
 
@@ -113,7 +113,7 @@ def _footer(g: GenerationResult | None, had_text: bool) -> str:
 
 def _pieces(question: str, result: QueryResult) -> Iterator[str]:
     """Content pieces for one request: streamed text/notices, then the footer."""
-    if result.pattern not in REAL_PATTERNS:
+    if not has_answer_path(result):
         yield result.message
         return
     final: GenerationResult | None = None
