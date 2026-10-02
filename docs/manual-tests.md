@@ -189,3 +189,37 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/v1/query -H "Cont
 ```
 
 Expected: `422` for each. With an empty `VOYAGE_API_KEY`, the success request returns HTTP 503 (`retrieval_not_ready`), not `no_results`.
+## Story 3.1 — Grounded Answer Generation
+
+What it adds: `generate_answer: true` on semantic `POST /v1/query` fills `generation` with a grounded, non-streaming answer and resolved citations, or an honest `insufficient_evidence`, `unavailable`, or `malformed` outcome.
+
+Prerequisite: Story 2.3 prerequisites, plus `GENERATION_API_BASE_URL` and `GENERATION_API_KEY` set in `.env` (OpenAI-compatible LiteLLM proxy; `GENERATION_MODEL_NAME` defaults to `gpt-4o-mini`). Restart the API after changing `.env`.
+
+```bash
+# Answerable question
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question": "What is the punishment for theft under the BNS?", "pattern": "semantic", "limit": 5, "generate_answer": true}' \
+  | jq '{status, g: (.generation | {outcome, model, provider, context_outcome, text: (.text[:300]), claims: [.claims[] | {t: .text[:80], e: .evidence_labels}], citations: [.citations[] | {label, chunk_id, section_id, act, heading}], trace}), ctx: [.results[] | {chunk_id, section_id, act, score}]}'
+```
+
+Expected: `generation.outcome: "answered"`, non-empty `text`, each claim has evidence labels, every citation `chunk_id` appears in `ctx` and `section_id` prefix matches `act` (`bns:` for `BNS_2023`).
+
+```bash
+# Unsupported question (insufficient evidence)
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question": "What is the GST rate on restaurant services?", "pattern": "semantic", "limit": 5, "generate_answer": true}' \
+  | jq '{status, g: (.generation | {outcome, text, claims: (.claims | length), citations: (.citations | length)}), results: (.results | length)}'
+```
+
+Expected: HTTP 200, `generation.outcome: "insufficient_evidence"`, empty `text`, 0 claims, 0 citations; retrieved `results` are still returned.
+
+```bash
+# Without generate_answer: no model call
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question": "What is theft?", "pattern": "semantic", "limit": 3}' \
+  | jq '{status, generation, results: (.results | length)}'
+```
+
+Expected: `status: "ok"`, `generation: null`, 1–3 results.
+
+Unavailable check: set `GENERATION_API_KEY=` empty in `.env`, restart the API, and rerun the first command. Expected: HTTP 200, `generation.outcome: "unavailable"`, empty `text`, `results` still present.
