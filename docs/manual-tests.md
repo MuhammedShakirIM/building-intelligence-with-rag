@@ -97,7 +97,7 @@ Expected: 422 validation error (question below min_length 1).
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "rag-semantic", "messages": [{"role": "user", "content": "What is theft?"}]}'
+  -d '{"model": "rag-hybrid", "messages": [{"role": "user", "content": "What is theft?"}]}'
 ```
 
 Expected: `"object":"chat.completion"`, `"finish_reason":"stop"`, content contains `not implemented yet`.
@@ -107,7 +107,7 @@ Expected: `"object":"chat.completion"`, `"finish_reason":"stop"`, content contai
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "rag-semantic", "messages": [{"role": "user", "content": "What is theft?"}], "stream": true}'
+  -d '{"model": "rag-hybrid", "messages": [{"role": "user", "content": "What is theft?"}], "stream": true}'
 ```
 
 Expected: SSE `data:` frames with `delta` role then content, ending with `data: [DONE]`.
@@ -223,3 +223,27 @@ curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
 Expected: `status: "ok"`, `generation: null`, 1–3 results.
 
 Unavailable check: set `GENERATION_API_KEY=` empty in `.env`, restart the API, and rerun the first command. Expected: HTTP 200, `generation.outcome: "unavailable"`, empty `text`, `results` still present.
+
+## Story 3.2 — Streamed Answers with Confidence
+
+What it adds: semantic chat streams a DRAFT-prefixed answer, then a confidence/sources footer; `/v1/query` returns the same result with `confidence`, `issues`, `attempts`.
+
+Prerequisite: Story 3.1 prerequisites. Optional `CAPSTONE_API_KEY` (chat then needs `Authorization: Bearer <key>`).
+
+```bash
+Q='What is the punishment for theft under the BNS?'
+curl -sN http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d "{\"model\":\"rag-semantic\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}]}" \
+  | grep '^data: {' | sed 's/^data: //' | jq -rj '.choices[0].delta.content // empty' | head -c 1500
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d "{\"question\":\"$Q\",\"pattern\":\"semantic\",\"generate_answer\":true}" \
+  | jq '{status, g: (.generation | {outcome, confidence, attempts, issues, citations: [.citations[] | {label, section_id}]})}'
+```
+
+Expected: stream shows `DRAFT — checking evidence`, labelled answer, `confidence: high`, `Sources:`; `/v1/query` agrees (`answered`, `high`, same citations).
+
+Unsupported: use "What is the GST rate on restaurant services?" — chat ends with the insufficient-evidence sentence (no confidence); `/v1/query` shows `insufficient_evidence` with `results` intact.
+
+Stream shape: `curl -sN ... | grep -c '^data: '` — role chunk, content chunks, `finish_reason: "stop"`, `data: [DONE]` last. With `CAPSTONE_API_KEY` set, a wrong Bearer → 401 `invalid_api_key`.
+
+Offline: `uv run pytest tests/test_streamed_confidence.py`

@@ -64,6 +64,20 @@ only allowed from `127.0.0.1`).
    save, and send a question. Hover the chip and click `×` to turn it off;
    re-enable it from the integrations menu next to `+`.
 
+## Reading answers
+
+- `DRAFT — checking evidence` precedes every streamed answer; it is shown
+  while the evidence check runs and cannot be retracted once streamed.
+- `Check failed: … Retrying (attempt 2 of 2)…` means the first draft failed
+  and a second one follows; ignore the first.
+- `Evidence check passed — confidence: high` plus `Sources:` lines marks the
+  validated answer. `DRAFT — low confidence, not the final answer.` means it
+  failed the check; do not rely on it.
+- The `capstone_api_key` Valve must equal the API's `CAPSTONE_API_KEY` when
+  that is set (leave both empty otherwise).
+- After updating the Pipe file, re-paste it via **Function Menu → Edit** and
+  save.
+
 ## Safe cleanup
 
 If you want to remove this incomplete local shell, first stop the server, then

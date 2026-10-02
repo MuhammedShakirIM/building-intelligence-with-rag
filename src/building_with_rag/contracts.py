@@ -93,6 +93,12 @@ class GenerationResult(BaseModel):
     provider: str | None = None
     trace: dict = Field(default_factory=dict)
     context_outcome: Literal["assembled", "empty"] | None = None
+    # Additive optional fields (Story 3.2).
+    confidence: Literal["high", "low"] | None = None
+    issues: list[dict] = Field(default_factory=list)  # {attempt, check, detail}
+    attempts: list[dict] = Field(default_factory=list)  # {attempt, status, chars, latency_ms}
+    draft_answer: str = ""
+    low_confidence_reason: str = ""
 
 
 class QueryResult(BaseModel):
@@ -110,8 +116,16 @@ class QueryResult(BaseModel):
     hyde_hypothetical_text_debug: str | None = None
 
 
+class ChatRagFilters(BaseModel):
+    """Nested filter shape sent by the Open WebUI Pipe."""
+
+    act: list[str] = Field(default_factory=list)
+    status: list[str] = Field(default_factory=list)
+
+
 class ChatRagOptions(BaseModel):
     pattern: Pattern = Pattern.SEMANTIC
+    filters: ChatRagFilters | None = None  # additive; flat act/status still accepted
     act: list[str] = Field(default_factory=list)
     status: list[str] = Field(default_factory=list)
     access_level: list[str] = Field(default_factory=list)
