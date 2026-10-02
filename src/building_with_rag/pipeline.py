@@ -5,9 +5,13 @@ from collections.abc import Iterator
 from building_with_rag.contracts import GenerationResult, QueryRequest, QueryResult
 from building_with_rag.generation.answer import Event, stream_answer
 from building_with_rag.registry import Pattern, run_pattern
+from building_with_rag.retrieval.hybrid import run_hybrid
 from building_with_rag.retrieval.semantic import QueryError, run_semantic
 
-__all__ = ["QueryError", "answer_events", "attach_generation", "retrieve"]
+__all__ = ["REAL_PATTERNS", "QueryError", "answer_events", "attach_generation", "retrieve"]
+
+# Modes with real retrieval; they share one context -> generation -> validation path.
+REAL_PATTERNS = frozenset({Pattern.SEMANTIC.value, Pattern.HYBRID.value})
 
 _OUTCOME_NOTE = {
     "answered": "Answer generated from the cited passages.",
@@ -22,15 +26,17 @@ _LOW_CONFIDENCE_NOTE = (
 
 
 def retrieve(request: QueryRequest) -> QueryResult:
-    """Semantic runs real retrieval; other modes use the shared placeholder dispatch."""
+    """Semantic and hybrid run real retrieval; other modes use the shared placeholder dispatch."""
     if request.pattern is Pattern.SEMANTIC:
         return run_semantic(request)
+    if request.pattern is Pattern.HYBRID:
+        return run_hybrid(request)
     return QueryResult(**run_pattern(request.pattern, request.question, request.caller_id))
 
 
 def answer_events(question: str, retrieval: QueryResult) -> Iterator[Event]:
-    """The single generation/validation operation; no events for non-semantic modes."""
-    if retrieval.pattern == Pattern.SEMANTIC.value:
+    """The single generation/validation operation; no events for placeholder modes."""
+    if retrieval.pattern in REAL_PATTERNS:
         yield from stream_answer(question, retrieval)
 
 

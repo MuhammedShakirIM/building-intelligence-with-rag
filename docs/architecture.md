@@ -42,7 +42,7 @@ One shared registry (single source of truth) holds only:
 | decomposition | `rag-decomposition` |
 | hyde | `rag-hyde` |
 
-`semantic` is real on `POST /v1/query` (Stories 2.3, 3.1) and on chat `rag-semantic` (Story 3.2); every other mode returns an honest `not_implemented` placeholder on both until its own story adds behavior.
+`semantic` is real on `POST /v1/query` (Stories 2.3, 3.1) and on chat `rag-semantic` (Story 3.2); `hybrid` is real on both (Story 4.1). Every other mode returns an honest `not_implemented` placeholder on both until its own story adds behavior. The selected mode decides the route; there is no automatic routing or fallback between modes.
 
 ## API contracts
 
@@ -73,7 +73,7 @@ A retrieved passage is always this shape: `chunk_id`, `section_id`, `act`, `text
 ### Endpoints
 
 - `GET /healthz` — safe, no credentials required.
-- `POST /v1/query` — accepts `QueryRequest`, returns `QueryResult`; `semantic` runs real retrieval, other modes return placeholders via the shared `run_pattern` path.
+- `POST /v1/query` — accepts `QueryRequest`, returns `QueryResult`; `semantic` and `hybrid` run real retrieval, other modes return placeholders via the shared `run_pattern` path.
 - `GET /v1/models` — lists the six `rag-<pattern>` model IDs.
 - `POST /v1/chat/completions` — OpenAI-compatible, text-only `ChatCompletionRequest`: `model`, `messages` with `system`/`developer`/`user`/`assistant` roles, `stream`, `n`, and optional strict `rag_options` (`pattern`, list filters, `limit`, `required_acts`, `chapter`).
 
@@ -162,7 +162,7 @@ Re-running with unchanged inputs skips everything and makes no Voyage calls. Cha
 - Single `access_level` (`public`).
 - Re-ingest is the only update path.
 - Dimensions or similarity changes need a manual index drop in Atlas.
-- No keyword/hybrid index fields yet.
+- Keyword search uses the Atlas Search index `chunk_text_index` on `chunks` (Story 4.1); `ingest` ignores it.
 
 ## Semantic retrieval (Story 2.3)
 
@@ -186,9 +186,31 @@ curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
   | jq '{status, trace, results: [.results[] | {chunk_id, section_id, act, heading, score, text: .text[:80]}]}'
 ```
 
+## Hybrid retrieval (Story 4.1)
+
+Code: `src/building_with_rag/retrieval/hybrid.py`, routed by `pipeline.retrieve` for `pattern: "hybrid"` (model `rag-hybrid`). Same corpus, database, chunks and embeddings as semantic; the selected mode decides the route (no automatic routing, no fallback to semantic).
+
+- Keyword route: Atlas Search `$search` with the `text` operator (BM25, `{$meta: "searchScore"}`) on `chunks.text`, index `chunk_text_index` (type `search`). Not `$text`, not the `vectorSearch` index. The question is only the `text.query` value.
+- Index definition (`mongodb_schema.KEYWORD_INDEX_DEFINITION`): `dynamic: false`; `text` string with `lucene.standard`; `act`, `status`, `access_level` as `token`. Filters use `in` inside `compound.filter` with the same effective filters as semantic (server-fixed `access_level=["public"]`).
+- Create/reuse: `uv run python -m building_with_rag.ingestion.keyword_index` (idempotent, waits up to 120 s for READY, no Voyage calls, no data writes; a different existing index is reported and never replaced). `ingest` ignores this index.
+- Fusion: Reciprocal Rank Fusion over ranks only. Each route returns its top `ROUTE_DEPTH = max(limit, min(50, max(20, 4*limit)))` chunks (semantic keeps the Story 2.3 `numCandidates` rule). `fused_score = Σ 1/(RRF_K + rank)`, `RRF_K = 60`, equal weights. Order: `fused_score` desc, then `semantic_rank` (missing last), then `chunk_id`. Chunks are fused by `chunk_id`; top `limit` returned.
+- New optional `RetrievedChunk` fields (default `None`; semantic leaves all `None`): `semantic_score`, `semantic_rank`, `keyword_score`, `keyword_rank`, `fused_score`, `fused_rank`. In hybrid `score == fused_score`; a `None` route did not return the chunk.
+- Trace: `mode`, `query`, `embedding`, `filters`, `caller_id`, `result_count`, `unresolved_hits`, `semantic`, `keyword`, `fusion` (`method`, `k`, `weights`, `route_depth`), `contribution` (`both`, `semantic_only`, `keyword_only`).
+- Outcomes: `ok`, `no_results` (both routes empty), 503 `retrieval_not_ready` (credentials, either index missing/not ready, empty embeddings; the message names the keyword-index command), 502 `retrieval_upstream_error`. A missing keyword index never degrades silently to semantic-only.
+- Shared path: context assembly, generation, validation, confidence and chat footer are the same as semantic (`pipeline.REAL_PATTERNS`).
+- Limitations: rank-only fusion ignores score magnitude; the `text` operator matches any query term (OR), so long natural-language questions can pull in common words; section numbers match only when they appear in chunk `text`; no stemming/synonyms beyond the standard analyzer. The fused score ranks only and does not prove correctness.
+
+Diagnostic command (text truncated):
+
+```bash
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question":"criminal breach of trust","pattern":"hybrid","limit":5}' \
+  | jq '{status, t: (.trace | {semantic, keyword, fusion, contribution}), r: [.results[] | {section_id, score, sr: .semantic_rank, kr: .keyword_rank, fr: .fused_rank, text: .text[:60]}]}'
+```
+
 ## Context and answer boundaries (Story 3.1)
 
-Code: `src/building_with_rag/generation/{context,answer}.py`, called from `routes/query.py` only when `pattern: "semantic"` and `generate_answer: true`.
+Code: `src/building_with_rag/generation/{context,answer}.py`, called from `routes/query.py` only for real modes (`semantic`, `hybrid`) with `generate_answer: true`.
 
 Flow: semantic `QueryResult` → bounded labelled context (`E1`…; at most 5 passages / 12,000 chars, never cut mid-passage) → one `POST {GENERATION_API_BASE_URL}/chat/completions` (`temperature: 0`, 30 s timeout, no retries) → strict JSON parse → citations resolved from the supplied context only.
 

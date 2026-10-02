@@ -37,10 +37,11 @@ Expected: `"status":"ok"` with ranked passages (see Story 2.3 below); needs Stor
 ```bash
 curl -s http://127.0.0.1:8000/v1/query \
   -H "Content-Type: application/json" \
-  -d '{"question": "What is theft?", "pattern": "hybrid"}'
+  -d '{"question": "criminal breach of trust", "pattern": "hybrid", "limit": 3}' \
+  | jq '{status, r: [.results[] | {section_id, score, sr: .semantic_rank, kr: .keyword_rank, fr: .fused_rank}]}'
 ```
 
-Expected: `"status":"not_implemented"`, message references `hybrid`.
+Expected: `"status":"ok"` with fused results (real since Story 4.1; needs `chunk_text_index`, else 503).
 
 ### Query — hybrid-reranked
 
@@ -97,7 +98,7 @@ Expected: 422 validation error (question below min_length 1).
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "rag-hybrid", "messages": [{"role": "user", "content": "What is theft?"}]}'
+  -d '{"model": "rag-hybrid-reranked", "messages": [{"role": "user", "content": "What is theft?"}]}'
 ```
 
 Expected: `"object":"chat.completion"`, `"finish_reason":"stop"`, content contains `not implemented yet`.
@@ -107,7 +108,7 @@ Expected: `"object":"chat.completion"`, `"finish_reason":"stop"`, content contai
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "rag-hybrid", "messages": [{"role": "user", "content": "What is theft?"}], "stream": true}'
+  -d '{"model": "rag-hybrid-reranked", "messages": [{"role": "user", "content": "What is theft?"}], "stream": true}'
 ```
 
 Expected: SSE `data:` frames with `delta` role then content, ending with `data: [DONE]`.
@@ -247,3 +248,26 @@ Unsupported: use "What is the GST rate on restaurant services?" — chat ends wi
 Stream shape: `curl -sN ... | grep -c '^data: '` — role chunk, content chunks, `finish_reason: "stop"`, `data: [DONE]` last. With `CAPSTONE_API_KEY` set, a wrong Bearer → 401 `invalid_api_key`.
 
 Offline: `uv run pytest tests/test_streamed_confidence.py`
+
+## Story 4.1 — Hybrid Search
+
+What it adds: `rag-hybrid` / `pattern: "hybrid"` fuses Atlas Search keyword hits on `chunks.text` with semantic hits (RRF, k=60).
+
+Prerequisite: Story 3.2 prerequisites; Atlas Search available. Voyage free tier is 3 requests/minute — space runs ~25 s apart.
+
+```bash
+uv run python -m building_with_rag.ingestion.keyword_index   # twice: created, then reusing
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question":"criminal breach of trust","pattern":"hybrid","limit":5}' \
+  | jq '{status, t: (.trace | {semantic, keyword, fusion, contribution}), r: [.results[] | {section_id, score, sr: .semantic_rank, kr: .keyword_rank, fr: .fused_rank, text: .text[:60]}]}'
+```
+
+Expected: index ends `chunk_text_index: READY (queryable)`; `status: ok`, ≤ `limit` results, `score` non-increasing and equal to fused score, each result has `sr` and/or `kr`.
+
+Compare modes: run one paraphrased and one exact-term question with `"pattern":"semantic"` and `"hybrid"`, `generate_answer: true`, `limit: 5`; note section order, contributing route(s), and `generation.outcome`.
+
+Chat: `rag-hybrid` streams DRAFT, confidence and `Sources:` as `rag-semantic` does; `rag-hybrid-reranked` still returns `not implemented yet`.
+
+Failure: with `chunk_text_index` missing, hybrid → 503 `retrieval_not_ready` (names the keyword-index command) while semantic stays `ok`.
+
+Offline: `uv run pytest tests/test_hybrid_retrieval.py`

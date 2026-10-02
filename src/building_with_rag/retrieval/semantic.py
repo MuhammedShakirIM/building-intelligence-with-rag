@@ -110,11 +110,12 @@ def _vector_filter(filters: dict[str, list[str]]) -> dict:
 def _check_scope(request: QueryRequest, settings) -> None:
     if request.caller_id is not None and request.caller_id != settings.webui_demo_caller_id:
         raise QueryError(422, "invalid_caller_id", "caller_id is not accepted for this server.")
+    mode = request.pattern.value
     if request.required_acts is not None:
         raise QueryError(422, "unsupported_option",
-                         "required_acts is not supported by semantic mode.")
+                         f"required_acts is not supported by {mode} mode.")
     if request.chapter is not None:
-        raise QueryError(422, "unsupported_option", "chapter is not supported by semantic mode.")
+        raise QueryError(422, "unsupported_option", f"chapter is not supported by {mode} mode.")
 
 
 def _chunk_result(chunk: dict, section: dict, score: float) -> RetrievedChunk:
