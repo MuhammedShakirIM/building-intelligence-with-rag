@@ -121,36 +121,32 @@ Each record has 14 fields: `section_id`, `act`, `act_label`, `status`, `chapter`
 
 ## MongoDB collections (Story 2.2)
 
-Four collections in `building_with_rag` (or `building_with_rag_test` when `APP_ENV=testing`):
+Four collections in the database named by `MONGODB_DB_NAME` (`MONGODB_TEST_DB_NAME` when `APP_ENV=testing`). Atlas (M0 free tier or higher) is required.
 
 | Collection | Role | Key fields |
 |---|---|---|
-| `sources` | One record per source act PDF | `_id` (`bns_source`/`ipc_source`), `act`, `source_sha256`, `section_count` |
-| `sections` | One record per section (858 total) | `_id` = `section_id`, `act`, `section_number`, `text`, `source_id` |
-| `chunks` | Overlapping chunks of section text | `_id` = deterministic chunk ID, `section_id`, `chunk_index`, `text`, `embedding_input` |
-| `embeddings` | One 1,024-dimension vector per chunk | `_id` = deterministic embedding ID, `chunk_id`, `vector`, `model`, `dimensions` |
+| `sources` | One record per act PDF | `_id` (`bns_source`/`ipc_source`), `act`, `source_sha256`, `section_count` |
+| `sections` | One record per corpus section (858) | `_id` = `section_id`, `act`, `section_number`, `chapter`, `heading`, `text`, `source_id` |
+| `chunks` | Overlapping pieces of section text | `_id` = `chunk_id`, `section_id`, `chunk_index`, `text`, `embedding_input`, `act`, `chapter`, `status`, `access_level` |
+| `embeddings` | One vector per chunk | `_id` = `embedding_id`, `chunk_id`, `vector` (1,024), `model`, `act`, `chapter`, `status`, `access_level` |
+
+`act`, `chapter`, `status`, `access_level` are copied onto `embeddings` so the vector index can filter without a join. Vectors are never stored on `chunks`.
 
 ### Chunking
 
-- **Library**: `langchain_text_splitters.RecursiveCharacterTextSplitter`
-- **Parameters**: `chunk_size=2048`, `chunk_overlap=256`, separators `["\n\n", "\n", ". ", " ", ""]`
-- **`chunking_version`**: `v1` — bump when chunking logic or embedding model changes to force re-chunking
-- **`embedding_input`**: prepends `[{act_label}] {heading}\n` to chunk text for better retrieval quality
-- Chunks never span sections or acts.
+- `RecursiveCharacterTextSplitter`, `chunk_size=2048`, `chunk_overlap=256`, separators `["\n\n", "\n", ". ", " ", ""]`; chunks never cross sections.
+- `embedding_input` = `[{act_label}] {heading}\n{chunk_text}`; `text` keeps the raw chunk.
+- `chunk_id = sha256(f"{section_id}:{chunk_index}:{chunking_version}")[:24]`; `CHUNKING_VERSION` (`v1`) is bumped when splitter settings or the `embedding_input` format change.
 
 ### Embedding
 
-- **Model**: `voyage-3.5`, 1,024 dimensions, cosine similarity
-- **Deterministic embedding ID**: `sha256(f"emb:{chunk_id}:{model}:{model_version}:{dimensions}")[:24]`
-- **Rate limiting**: 0.2s delay between API calls; retry on 429
+- `voyage-3.5`, 1,024 dimensions, cosine; documents use `input_type="document"`, queries `"query"`.
+- `embedding_id = sha256(f"emb:{chunk_id}:{model}:{model_version}:{dimensions}")[:24]`.
+- Batches of 10 chunks, 25 s pause (free-tier limit), up to 4 attempts with growing backoff on Voyage errors. Each batch is written immediately, so an interrupted run resumes. About 35-40 min for ~900 chunks on a free key.
 
 ### Vector index
 
-- **Name**: `vector_index`
-- **Type**: `vectorSearch` (Atlas Search)
-- **Definition**: `knnVector` on `vector` field, 1,024 dimensions, cosine similarity; `token` fields for `act`, `status`, `access_level`, `chapter` to support `$vectorSearch` filter clauses
-- **Creation**: `createSearchIndexes` command; waits up to 60s for `READY`
-- **Safe re-run**: skips if compatible index exists; errors if incompatible; creates if absent
+`vector_index` on `embeddings`, type `vectorSearch`, `fields` array: `vector` (`numDimensions` 1024, cosine) plus `filter` fields `act`, `chapter`, `status`, `access_level`. Created with `create_search_index`; the runner waits up to 120 s for `READY`. A different existing index stops the run (drop it manually in Atlas); it is never replaced automatically.
 
 ### Ingestion command
 
@@ -158,9 +154,12 @@ Four collections in `building_with_rag` (or `building_with_rag_test` when `APP_E
 uv run python -m building_with_rag.ingestion.ingest
 ```
 
+Re-running with unchanged inputs skips everything and makes no Voyage calls. Changed sections or chunks are replaced and re-embedded; removed ones are deleted. The run ends with a sample `$vectorSearch` ("punishment for theft") printing `chunk_id`, `section_id`, heading and score, or `vector query pending` if the index is not ready.
+
 ### Limitations
 
-- MongoDB Community Edition unsupported — requires Atlas (M0+ free tier) or Enterprise with Atlas Search
-- Single `access_level` (`public`) — no multi-tenant filtering
-- No incremental partial updates — re-ingest replaces changed records, cleans up orphans
-- Vector index must be dropped manually in Atlas UI to change dimensions or similarity
+- Atlas required; no `$text`, `$geoNear` or client-side fallback.
+- Single `access_level` (`public`).
+- Re-ingest is the only update path.
+- Dimensions or similarity changes need a manual index drop in Atlas.
+- No keyword/hybrid index fields yet.

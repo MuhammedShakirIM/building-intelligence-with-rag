@@ -259,18 +259,11 @@ def ensure_ordinary_indexes(db):
 VECTOR_INDEX_NAME = "vector_index"
 
 VECTOR_INDEX_DEFINITION = {
-    "mappings": {
-        "dynamic": False,
-        "fields": {
-            "vector": {
-                "type": "knnVector",
-                "dimensions": 1024,
-                "similarity": "cosine",
-            },
-            "act": {"type": "token"},
-            "status": {"type": "token"},
-            "access_level": {"type": "token"},
-            "chapter": {"type": "token"},
-        },
-    },
+    "fields": [
+        {"type": "vector", "path": "vector", "numDimensions": 1024, "similarity": "cosine"},
+        {"type": "filter", "path": "act"},
+        {"type": "filter", "path": "chapter"},
+        {"type": "filter", "path": "status"},
+        {"type": "filter", "path": "access_level"},
+    ]
 }

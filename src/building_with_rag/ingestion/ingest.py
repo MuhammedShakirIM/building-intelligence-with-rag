@@ -12,6 +12,7 @@ from pathlib import Path
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure, PyMongoError
+from pymongo.operations import SearchIndexModel
 from voyageai import Client as VoyageClient
 from voyageai.error import VoyageError
 
@@ -46,87 +47,38 @@ def _load_jsonl(path: Path) -> list[dict]:
 
 
 def _check_mongodb(settings) -> MongoClient:
-    """Run MongoDB prerequisite checks; return a connected client or raise SystemExit."""
-    uri = settings.mongodb_uri
-    if not uri:
+    # Prerequisite checks per story; stop on the first failure. Never print the URI.
+    if not settings.mongodb_uri:
         raise SystemExit("MongoDB unavailable: MONGODB_URI is empty. Set it in .env and re-run.")
+    if not settings.voyage_api_key:
+        raise SystemExit("VOYAGE_API_KEY is empty. Set it in .env and re-run.")
 
+    client: MongoClient = MongoClient(settings.mongodb_uri, serverSelectionTimeoutMS=5000)
     try:
-        client: MongoClient = MongoClient(uri, serverSelectionTimeoutMS=5000)
         client.admin.command("ping")
-    except PyMongoError as exc:
+    except PyMongoError:
         raise SystemExit(
-            f"MongoDB unavailable: could not connect to {uri}. "
-            f"Check MONGODB_URI and that the deployment is running. ({exc})"
-        ) from exc
+            "MongoDB unavailable: could not connect. Check MONGODB_URI and that the cluster is running."
+        ) from None
 
-    # Detect deployment type and vector-search capability
-    try:
-        build_info = client.admin.command("buildInfo")
-        version_str: str = build_info.get("version", "")
-        major = int(version_str.split(".")[0]) if version_str else 0
-    except OperationFailure:
-        major = 0
-
-    # Check for Atlas
-    try:
-        cmd_line = client.admin.command("getCmdLineOpts")
-        argv = cmd_line.get("argv", [])
-        is_atlas = any("mongodb.net" in arg or "atlas" in arg.lower() for arg in argv)
-    except OperationFailure:
-        is_atlas = False
-
-    # Also check server status for atlasVersion
-    try:
-        server_status = client.admin.command("serverStatus")
-        atlas_version = server_status.get("atlasVersion")
-        if atlas_version:
-            is_atlas = True
-    except OperationFailure:
-        pass
-
-    if not is_atlas and major >= 7:
-        # MongoDB 7.0+ community — check if vector search available
+    is_atlas = "mongodb.net" in settings.mongodb_uri
+    if not is_atlas:
         try:
-            client.admin.command({"vectorSearch": 1})
-        except OperationFailure as exc:
-            if "no such command" in str(exc).lower() or "unrecognized" in str(exc).lower():
-                raise SystemExit(
-                    "MongoDB Community Edition does not support vector search indexes. "
-                    "Use MongoDB Atlas (M0 free tier or higher) or MongoDB Enterprise "
-                    "with Atlas Search enabled. This project requires $vectorSearch."
-                )
-    elif not is_atlas and major < 6:
-        raise SystemExit(
-            f"MongoDB {major}.x does not support vector search. "
-            "Use MongoDB Atlas (M0 free tier or higher) or MongoDB Enterprise 6.0+."
-        )
-
-    # Check createSearchIndex privilege
-    db_name = settings.mongodb_db_name if settings.app_env != "testing" else settings.mongodb_test_db_name
-    db = client[db_name]
-    try:
-        # Test creating and immediately dropping a dummy index on a temp collection
-        temp_coll = "__prereq_check_temp__"
-        db.create_collection(temp_coll)
-        try:
-            db.command(
-                "createSearchIndexes",
-                temp_coll,
-                indexes=[{"name": "temp", "type": "vectorSearch", "definition": {}}],
-            )
+            is_atlas = "atlasVersion" in client.admin.command("serverStatus")
         except OperationFailure:
-            pass  # May fail on definition validation; the key is we weren't denied
-        finally:
-            db.drop_collection(temp_coll)
+            pass
+    if not is_atlas:
+        raise SystemExit("Atlas Search is required for $vectorSearch. Use an Atlas cluster (M0 free tier or higher).")
+
+    db_name = settings.mongodb_test_db_name if settings.app_env == "testing" else settings.mongodb_db_name
+    try:
+        list(client[db_name][schema.EMBEDDINGS_COLLECTION].list_search_indexes())
     except OperationFailure as exc:
         if exc.code == 13 or "not authorized" in str(exc).lower():
             raise SystemExit(
-                "Permission missing: the connected user cannot create search indexes. "
-                "Grant the atlasAdmin role (Atlas) or equivalent, then re-run."
-            ) from exc
-        # Other errors (e.g. invalid definition) are fine — means we have permission
-
+                "Permission missing: the connected user cannot manage search indexes. Grant a role that "
+                "allows it (for example Atlas admin on the project), then re-run."
+            ) from None
     return client
 
 # ---------------------------------------------------------------------------
@@ -194,129 +146,112 @@ def _ingest_sections(db, sections_coll: str, records: list[dict]) -> dict:
     return stats
 
 
+def _delete_removed_sections(db, records: list[dict]) -> int:
+    # Remove sections no longer in the corpus, with their chunks and embeddings.
+    keep = [r["section_id"] for r in records]
+    gone = [s["_id"] for s in db[schema.SECTIONS_COLLECTION].find({"_id": {"$nin": keep}}, {"_id": 1})]
+    if gone:
+        cids = [c["_id"] for c in db[schema.CHUNKS_COLLECTION].find({"section_id": {"$in": gone}}, {"_id": 1})]
+        db[schema.EMBEDDINGS_COLLECTION].delete_many({"chunk_id": {"$in": cids}})
+        db[schema.CHUNKS_COLLECTION].delete_many({"section_id": {"$in": gone}})
+        db[schema.SECTIONS_COLLECTION].delete_many({"_id": {"$in": gone}})
+    return len(gone)
+
+
 def _chunk_sections(db, sections_coll: str, chunks_coll: str) -> tuple[int, list[str]]:
-    """Chunk all sections; store chunk docs. Returns (new_chunk_count, all_chunk_ids)."""
+    # Chunk all sections; returns (inserted+replaced count, all current chunk ids).
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=schema.CHUNK_SIZE,
         chunk_overlap=schema.CHUNK_OVERLAP,
         separators=schema.CHUNK_SEPARATORS,
     )
-    sections_collection = db[sections_coll]
-    chunks_collection = db[chunks_coll]
-    new_chunk_ids: list[str] = []
-    all_chunk_ids: list[str] = []
-    stats = {"inserted": 0, "replaced": 0, "skipped": 0}
+    chunks_c, emb_c = db[chunks_coll], db[schema.EMBEDDINGS_COLLECTION]
+    current: list[str] = []
+    stats = {"inserted": 0, "replaced": 0, "skipped": 0, "deleted": 0, "empty_sections": 0}
 
-    for section in sections_collection.find().sort("section_id", 1):
-        text: str = section["text"]
-        heading: str = section.get("heading", "")
-        act_label: str = section.get("act_label", "")
-        if not text.strip():
+    for section in db[sections_coll].find().sort("section_id", 1):
+        if not section["text"].strip():
+            stats["empty_sections"] += 1
             continue
-
-        raw_chunks = splitter.split_text(text)
-        for idx, chunk_text in enumerate(raw_chunks):
-            embedding_input = f"[{act_label}] {heading}\n{chunk_text}".strip()
-            doc = schema.build_chunk_doc(
-                section=section, chunk_index=idx, text=chunk_text,
-                embedding_input=embedding_input,
-            )
-            all_chunk_ids.append(doc["_id"])
-
-            existing = chunks_collection.find_one({"_id": doc["_id"]})
+        for idx, chunk_text in enumerate(splitter.split_text(section["text"])):
+            embedding_input = f"[{section.get('act_label', '')}] {section.get('heading', '')}\n{chunk_text}"
+            doc = schema.build_chunk_doc(section=section, chunk_index=idx, text=chunk_text,
+                                         embedding_input=embedding_input)
+            current.append(doc["_id"])
+            existing = chunks_c.find_one({"_id": doc["_id"]})
             if existing is None:
-                chunks_collection.insert_one(doc)
+                chunks_c.insert_one(doc)
                 stats["inserted"] += 1
-                new_chunk_ids.append(doc["_id"])
-            elif existing.get("text") != chunk_text or existing.get("chunking_version") != schema.CHUNKING_VERSION:
+            elif any(existing.get(k) != doc[k] for k in ("text", "embedding_input", "chunking_version")):
                 doc["created_at"] = existing.get("created_at", doc["created_at"])
-                chunks_collection.replace_one({"_id": doc["_id"]}, doc, upsert=True)
+                chunks_c.replace_one({"_id": doc["_id"]}, doc)
+                emb_c.delete_many({"chunk_id": doc["_id"]})  # re-embed changed chunk
                 stats["replaced"] += 1
-                new_chunk_ids.append(doc["_id"])
             else:
                 stats["skipped"] += 1
 
-    # Orphan cleanup: remove chunks whose chunking_version doesn't match
-    chunks_collection.delete_many({"chunking_version": {"$ne": schema.CHUNKING_VERSION}})
+    stale = [c["_id"] for c in chunks_c.find({"_id": {"$nin": current}}, {"_id": 1})]
+    if stale:
+        emb_c.delete_many({"chunk_id": {"$in": stale}})
+        chunks_c.delete_many({"_id": {"$in": stale}})
+    stats["deleted"] = len(stale)
 
-    # Refresh chunk_ids after cleanup
-    all_chunk_ids = [c["_id"] for c in chunks_collection.find({}, {"_id": 1})]
-
-    chunk_count = stats["inserted"] + stats["replaced"]
-    print(f"  Chunks: {stats['inserted']} inserted, {stats['replaced']} replaced, "
-          f"{stats['skipped']} skipped")
-    return chunk_count, all_chunk_ids
+    print("  Chunks: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in stats.items()))
+    return stats["inserted"] + stats["replaced"], current
 
 
 VOYAGE_BATCH_SIZE = 10
-VOYAGE_BATCH_DELAY = 25  # seconds — 2.4 RPM, ~5K tokens/batch under 10K TPM
+VOYAGE_BATCH_DELAY = 25  # seconds; free-tier rate limit
+
+
+def _embed_with_retry(vc, texts: list[str], input_type: str = "document", attempts: int = 4):
+    # Retry Voyage errors (e.g. 429) with growing backoff, bounded attempts.
+    for attempt in range(1, attempts + 1):
+        try:
+            return vc.embed(texts=texts, model=schema.EMBEDDING_MODEL, input_type=input_type).embeddings
+        except VoyageError as exc:
+            if attempt == attempts:
+                raise
+            wait = 30 * attempt
+            print(f"  Voyage error ({type(exc).__name__}); retry {attempt}/{attempts - 1} in {wait}s")
+            time.sleep(wait)
 
 
 def _embed_chunks(db, embeddings_coll: str, chunk_ids: list[str], settings) -> dict:
-    """Embed new/changed chunks using Voyage in batches. Returns stats."""
-    stats = {"inserted": 0, "replaced": 0, "skipped": 0}
-    chunks_collection = db[schema.CHUNKS_COLLECTION]
-    embeddings_collection = db[embeddings_coll]
+    stats = {"inserted": 0, "skipped": 0, "deleted": 0}
+    chunks_c, emb_c = db[schema.CHUNKS_COLLECTION], db[embeddings_coll]
 
-    if not settings.voyage_api_key:
-        print("  WARNING: VOYAGE_API_KEY is empty. Skipping embedding step.")
+    # Drop embeddings of removed chunks or other model settings (before inserting new ones)
+    stats["deleted"] = emb_c.delete_many({"$or": [
+        {"chunk_id": {"$nin": chunk_ids}},
+        {"model": {"$ne": schema.EMBEDDING_MODEL}},
+        {"model_version": {"$ne": schema.EMBEDDING_MODEL_VERSION}},
+        {"dimensions": {"$ne": schema.EMBEDDING_DIMENSIONS}},
+    ]}).deleted_count
+
+    have = {e["chunk_id"] for e in emb_c.find({}, {"chunk_id": 1})}
+    to_embed = [c for c in chunks_c.find({"_id": {"$in": chunk_ids}}) if c["_id"] not in have]
+    stats["skipped"] = len(chunk_ids) - len(to_embed)
+    if not to_embed:
+        print(f"  Embeddings: 0 inserted, {stats['skipped']} skipped, {stats['deleted']} deleted")
         return stats
 
     vc = VoyageClient(api_key=settings.voyage_api_key)
-    all_chunks = list(chunks_collection.find({"_id": {"$in": chunk_ids}}))
-
-    # Only embed chunks that don't already have a matching embedding
-    to_embed: list[dict] = []
-    for chunk in all_chunks:
-        embedding_id = schema.build_embedding_id(chunk["_id"])
-        if embeddings_collection.find_one({"_id": embedding_id}) is None:
-            to_embed.append(chunk)
-        else:
-            stats["skipped"] += 1
-
-    if not to_embed:
-        print(f"  Embeddings: 0 inserted, 0 replaced, {stats['skipped']} skipped (all cached)")
-        return stats
-
-    # Batch embed
-    batches = [
-        to_embed[i : i + VOYAGE_BATCH_SIZE]
-        for i in range(0, len(to_embed), VOYAGE_BATCH_SIZE)
-    ]
-    for batch_idx, batch in enumerate(batches):
-        texts = [chunk["embedding_input"] for chunk in batch]
-        try:
-            result = vc.embed(texts=texts, model=schema.EMBEDDING_MODEL, input_type="document")
-            vectors = result.embeddings
-        except VoyageError as exc:
-            # Retry once after a wait on rate-limit
-            print(f"  Error on batch {batch_idx + 1}/{len(batches)}: {exc}; "
-                  f"waiting 30s then retrying...")
-            time.sleep(30)
-            result = vc.embed(texts=texts, model=schema.EMBEDDING_MODEL, input_type="document")
-            vectors = result.embeddings
-
+    batches = [to_embed[i:i + VOYAGE_BATCH_SIZE] for i in range(0, len(to_embed), VOYAGE_BATCH_SIZE)]
+    print(f"  {len(to_embed)} chunks, {len(batches)} batches; ~{len(batches) * VOYAGE_BATCH_DELAY // 60} min "
+          "on a free Voyage key. Safe to interrupt and re-run.")
+    for n, batch in enumerate(batches, 1):
+        vectors = _embed_with_retry(vc, [c["embedding_input"] for c in batch])
         for chunk, vector in zip(batch, vectors):
-            doc = schema.build_embedding_doc(chunk=chunk, vector=vector)
-            embeddings_collection.insert_one(doc)
+            if len(vector) != schema.EMBEDDING_DIMENSIONS:
+                raise SystemExit(f"Voyage returned {len(vector)} dimensions, expected {schema.EMBEDDING_DIMENSIONS}.")
+            emb_c.insert_one(schema.build_embedding_doc(chunk=chunk, vector=vector))
             stats["inserted"] += 1
-
-        print(f"  Embedded batch {batch_idx + 1}/{len(batches)} "
-              f"({len(batch)} chunks, {stats['inserted']}/{len(to_embed)} total)")
-
-        if batch_idx < len(batches) - 1:
+        print(f"  Embedded batch {n}/{len(batches)} ({stats['inserted']}/{len(to_embed)} total)")
+        if n < len(batches):
             time.sleep(VOYAGE_BATCH_DELAY)
 
-    # Orphan cleanup
-    embeddings_collection.delete_many({
-        "$or": [
-            {"model_version": {"$ne": schema.EMBEDDING_MODEL_VERSION}},
-            {"dimensions": {"$ne": schema.EMBEDDING_DIMENSIONS}},
-        ]
-    })
-
-    print(f"  Embeddings: {stats['inserted']} inserted, {stats['replaced']} replaced, "
-          f"{stats['skipped']} skipped")
+    print(f"  Embeddings: {stats['inserted']} inserted, {stats['skipped']} skipped, {stats['deleted']} deleted")
     return stats
 
 # ---------------------------------------------------------------------------
@@ -324,87 +259,58 @@ def _embed_chunks(db, embeddings_coll: str, chunk_ids: list[str], settings) -> d
 # ---------------------------------------------------------------------------
 
 
+_REQUIRED_FILTERS = ("act", "chapter", "status", "access_level")
+
+
+def _find_index(coll):
+    return next((i for i in coll.list_search_indexes() if i.get("name") == schema.VECTOR_INDEX_NAME), None)
+
+
+def _index_diffs(definition: dict) -> list[str]:
+    fields = definition.get("fields", [])
+    vec = next((f for f in fields if f.get("type") == "vector" and f.get("path") == "vector"), None)
+    diffs = []
+    if vec is None:
+        diffs.append("no vector field on path 'vector'")
+    else:
+        if vec.get("numDimensions") != schema.EMBEDDING_DIMENSIONS:
+            diffs.append(f"numDimensions={vec.get('numDimensions')} (expected {schema.EMBEDDING_DIMENSIONS})")
+        if vec.get("similarity") != "cosine":
+            diffs.append(f"similarity={vec.get('similarity')} (expected cosine)")
+    have = {f.get("path") for f in fields if f.get("type") == "filter"}
+    missing = [p for p in _REQUIRED_FILTERS if p not in have]
+    if missing:
+        diffs.append(f"missing filter fields: {missing}")
+    return diffs
+
+
 def _ensure_vector_index(db, embeddings_coll: str) -> str:
-    """Create or verify the vector search index. Returns status string."""
-    collection = db[embeddings_coll]
+    # Create, reuse if compatible, or stop on a mismatch (never drop).
+    coll = db[embeddings_coll]
+    idx = _find_index(coll)
+    if idx is not None:
+        diffs = _index_diffs(idx.get("latestDefinition") or idx.get("definition") or {})
+        if diffs:
+            raise SystemExit(f"Vector index '{schema.VECTOR_INDEX_NAME}' differs: {'; '.join(diffs)}. "
+                             "Drop it manually in the Atlas UI, then re-run.")
+        if idx.get("queryable") or idx.get("status") == "READY":
+            return "READY"
+    else:
+        coll.create_search_index(SearchIndexModel(
+            name=schema.VECTOR_INDEX_NAME, type="vectorSearch",
+            definition=schema.VECTOR_INDEX_DEFINITION))
 
-    # Check for existing index
-    existing_def = None
-    existing_status = None
-    try:
-        indexes = list(collection.aggregate([{"$listSearchIndexes": {}}]))
-    except OperationFailure:
-        indexes = []
-
-    for idx in indexes:
-        if idx.get("name") == schema.VECTOR_INDEX_NAME:
-            existing_status = idx.get("status")
-            existing_def = idx.get("latestDefinition") or idx.get("definition", {})
-            break
-
-    if existing_def is not None:
-        existing_fields = existing_def.get("mappings", {}).get("fields", {})
-        vector_field = existing_fields.get("vector", {})
-
-        compatible = (
-            vector_field.get("type") == "knnVector"
-            and vector_field.get("dimensions") == 1024
-            and vector_field.get("similarity") == "cosine"
-        )
-        if compatible:
-            if existing_status == "READY":
-                return "READY"
-            return f"PENDING (status: {existing_status})"
-
-        # Incompatible — report and stop
-        diff_parts = []
-        if vector_field.get("dimensions") != 1024:
-            diff_parts.append(f"dimensions={vector_field.get('dimensions')} (expected 1024)")
-        if vector_field.get("similarity") != "cosine":
-            diff_parts.append(f"similarity={vector_field.get('similarity')} (expected cosine)")
-        if vector_field.get("type") != "knnVector":
-            diff_parts.append(f"type={vector_field.get('type')} (expected knnVector)")
-
-        raise SystemExit(
-            f"Vector index '{schema.VECTOR_INDEX_NAME}' exists but is incompatible: "
-            f"{'; '.join(diff_parts)}. "
-            "Drop it manually in the Atlas UI if you need to recreate."
-        )
-
-    # Create new index
-    try:
-        collection.database.command(
-            "createSearchIndexes",
-            embeddings_coll,
-            indexes=[{
-                "name": schema.VECTOR_INDEX_NAME,
-                "type": "vectorSearch",
-                "definition": schema.VECTOR_INDEX_DEFINITION,
-            }],
-        )
-    except OperationFailure as exc:
-        raise SystemExit(f"Failed to create vector search index: {exc}") from exc
-
-    # Wait up to 60s for READY
-    waited = 0
-    while waited < 60:
+    status = None
+    for waited in range(5, 125, 5):
         time.sleep(5)
-        waited += 5
-        try:
-            indexes = list(collection.aggregate([{"$listSearchIndexes": {}}]))
-            for idx in indexes:
-                if idx.get("name") == schema.VECTOR_INDEX_NAME:
-                    if idx.get("status") == "READY":
-                        return "READY"
-                    existing_status = idx.get("status")
-        except OperationFailure:
-            pass
-        print(f"  Waiting for index... ({waited}s, status: {existing_status})")
-
-    print(f"  Index '{schema.VECTOR_INDEX_NAME}' timed out waiting for READY. "
-          f"Last status: {existing_status}. "
-          "Check manually: db.embeddings.aggregate([{$listSearchIndexes: {}}])")
-    return f"TIMEOUT (last status: {existing_status})"
+        idx = _find_index(coll)
+        status = idx.get("status") if idx else "UNKNOWN"
+        if idx and (idx.get("queryable") or status == "READY"):
+            return "READY"
+        print(f"  Waiting for index... ({waited}s, status: {status})")
+    print(f"  Index '{schema.VECTOR_INDEX_NAME}' not READY after 120s (last status: {status}). "
+          "Re-check: db.embeddings.aggregate([{$listSearchIndexes: {}}])")
+    return f"TIMEOUT (last status: {status})"
 
 # ---------------------------------------------------------------------------
 # Sample query
@@ -412,49 +318,28 @@ def _ensure_vector_index(db, embeddings_coll: str) -> str:
 
 
 def _sample_vector_query(db, settings) -> str:
-    """Run a sample $vectorSearch query. Returns description string."""
-    if not settings.voyage_api_key:
-        return "skipped (no VOYAGE_API_KEY)"
-
+    # Report errors instead of raising.
+    pending = "vector query pending — index not ready"
     vc = VoyageClient(api_key=settings.voyage_api_key)
     try:
-        result = vc.embed(
-            texts=["punishment for theft"],
-            model=schema.EMBEDDING_MODEL,
-            input_type="query",
-        )
-        query_vector = result.embeddings[0]
-    except PyMongoError as exc:
-        return f"skipped (Voyage query embedding failed: {exc})"
-
-    embeddings_coll = db[schema.EMBEDDINGS_COLLECTION]
-    try:
-        agg_result = list(embeddings_coll.aggregate([
-            {
-                "$vectorSearch": {
-                    "index": schema.VECTOR_INDEX_NAME,
-                    "path": "vector",
-                    "queryVector": query_vector,
-                    "numCandidates": 10,
-                    "limit": 1,
-                }
-            },
-            {
-                "$project": {"chunk_id": 1, "_id": 0}
-            },
+        qv = vc.embed(texts=["punishment for theft"], model=schema.EMBEDDING_MODEL,
+                      input_type="query").embeddings[0]
+        rows = list(db[schema.EMBEDDINGS_COLLECTION].aggregate([
+            {"$vectorSearch": {
+                "index": schema.VECTOR_INDEX_NAME, "path": "vector", "queryVector": qv,
+                "numCandidates": 50, "limit": 1, "filter": {"access_level": "public"}}},
+            {"$project": {"_id": 0, "chunk_id": 1, "score": {"$meta": "vectorSearchScore"}}},
         ]))
-    except OperationFailure as exc:
-        if "index" in str(exc).lower() and "not ready" in str(exc).lower():
-            return "pending — index not ready"
-        return f"error: {exc}"
-
-    if not agg_result:
-        return "no results"
-
-    top_chunk_id = agg_result[0]["chunk_id"]
-    chunk = db[schema.CHUNKS_COLLECTION].find_one({"_id": top_chunk_id})
-    heading = (chunk or {}).get("section_id", "unknown")
-    return f"top chunk: {top_chunk_id} (section: {heading})"
+    except VoyageError as exc:
+        return f"error: Voyage query embedding failed: {exc}"
+    except PyMongoError as exc:
+        return pending if "not ready" in str(exc).lower() else f"error: {exc}"
+    if not rows:
+        return pending
+    chunk = db[schema.CHUNKS_COLLECTION].find_one({"_id": rows[0]["chunk_id"]}) or {}
+    section = db[schema.SECTIONS_COLLECTION].find_one({"_id": chunk.get("section_id")}) or {}
+    return (f"chunk_id={rows[0]['chunk_id']} section_id={chunk.get('section_id')} "
+            f"heading={section.get('heading')!r} score={rows[0]['score']:.4f}")
 
 # ---------------------------------------------------------------------------
 # Doc comparison
@@ -518,6 +403,9 @@ def run(settings=None):
     print("5. Ingesting sections...")
     section_stats = _ingest_sections(db, schema.SECTIONS_COLLECTION, all_records)
     print(f"   {section_stats}")
+    removed = _delete_removed_sections(db, all_records)
+    if removed:
+        print(f"   Removed {removed} sections no longer in corpus")
     print()
 
     # 6. Chunk sections
@@ -560,26 +448,16 @@ def run(settings=None):
 
 
 def _print_verification(db, chunk_count: int, embed_stats: dict):
-    """Run classroom-sized verification checks."""
-    # Collection counts
-    sources_count = db[schema.SOURCES_COLLECTION].count_documents({})
-    sections_count = db[schema.SECTIONS_COLLECTION].count_documents({})
-    chunks_count = db[schema.CHUNKS_COLLECTION].count_documents({})
-    embeddings_count = db[schema.EMBEDDINGS_COLLECTION].count_documents({})
-    print(f"   Collections: sources={sources_count}, sections={sections_count}, "
-          f"chunks={chunks_count}, embeddings={embeddings_count}")
-
-    # Section-to-chunk link
-    chunks_for_bns1 = list(db[schema.CHUNKS_COLLECTION].find({"section_id": "bns:1"}))
-    print(f"   bns:1 chunks: {len(chunks_for_bns1)}")
-
-    # Embedding dimension check
-    sample_embedding = db[schema.EMBEDDINGS_COLLECTION].find_one()
-    if sample_embedding:
-        vec_len = len(sample_embedding.get("vector", []))
-        print(f"   Sample embedding dimension: {vec_len} (expected 1024)")
-    else:
-        print("   No embeddings found")
+    # Classroom-sized checks: counts, section link, vector length.
+    counts = {n: db[n].count_documents({}) for n in (
+        schema.SOURCES_COLLECTION, schema.SECTIONS_COLLECTION,
+        schema.CHUNKS_COLLECTION, schema.EMBEDDINGS_COLLECTION)}
+    print("   Collections: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    print(f"   embeddings == chunks: {counts['embeddings'] == counts['chunks']}")
+    bns1 = list(db[schema.CHUNKS_COLLECTION].find({"section_id": "bns:1"}, {"section_id": 1}))
+    print(f"   bns:1 chunks: {len(bns1)} (all linked: {all(c['section_id'] == 'bns:1' for c in bns1)})")
+    sample = db[schema.EMBEDDINGS_COLLECTION].find_one({}, {"vector": 1})
+    print(f"   Sample vector length: {len(sample['vector']) if sample else 'none'} (expected 1024)")
 
 
 if __name__ == "__main__":
