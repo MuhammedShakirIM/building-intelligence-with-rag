@@ -20,6 +20,11 @@ This is a shared training capstone; token waste multiplies across 20+ users.
   If no changes: `No changes.` Include developer action items only when present.
 - Keep plans, comments, docs, commits, tests, and generated stories compact.
 
+## Prompts and stories
+
+- Fix problems in the source prompt (handout) first. A story patched locally does not reach other participants.
+- Before writing a story, check each verification/data-check step for token waste. Require compact output only (counts, status, lengths). Never print vectors, embeddings, full passages, or raw documents.
+
 ## Retrieval/manual testing
 
 - Never pretty-print full retrieval responses. Do not use `curl ... | python3 -m json.tool`.
