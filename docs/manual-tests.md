@@ -30,7 +30,7 @@ curl -s http://127.0.0.1:8000/v1/query \
   -d '{"question": "What is theft?", "pattern": "semantic"}'
 ```
 
-Expected: `"status":"not_implemented"`, `"message":"Pattern 'semantic' is not implemented yet..."`.
+Expected: `"status":"ok"` with ranked passages (see Story 2.3 below); needs Story 2.2 ingestion and `.env` credentials, otherwise HTTP 503.
 
 ### Query — hybrid
 

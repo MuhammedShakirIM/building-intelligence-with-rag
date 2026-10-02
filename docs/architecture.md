@@ -42,7 +42,7 @@ One shared registry (single source of truth) holds only:
 | decomposition | `rag-decomposition` |
 | hyde | `rag-hyde` |
 
-All modes return honest `not_implemented` placeholder results until their own stories add behavior.
+`semantic` is real on `POST /v1/query` (Story 2.3); chat for `rag-semantic` and every other mode still return honest `not_implemented` placeholders until their own stories add behavior.
 
 ## API contracts
 
@@ -73,7 +73,7 @@ A retrieved passage is always this shape: `chunk_id`, `section_id`, `act`, `text
 ### Endpoints
 
 - `GET /healthz` — safe, no credentials required.
-- `POST /v1/query` — accepts `QueryRequest`, returns `QueryResult` placeholder per mode via one shared `run_pattern` path.
+- `POST /v1/query` — accepts `QueryRequest`, returns `QueryResult`; `semantic` runs real retrieval, other modes return placeholders via the shared `run_pattern` path.
 - `GET /v1/models` — lists the six `rag-<pattern>` model IDs.
 - `POST /v1/chat/completions` — OpenAI-compatible, text-only `ChatCompletionRequest`: `model`, `messages` with `system`/`developer`/`user`/`assistant` roles, `stream`, `n`, and optional strict `rag_options` (`pattern`, list filters, `limit`, `required_acts`, `chapter`).
 
@@ -163,3 +163,25 @@ Re-running with unchanged inputs skips everything and makes no Voyage calls. Cha
 - Re-ingest is the only update path.
 - Dimensions or similarity changes need a manual index drop in Atlas.
 - No keyword/hybrid index fields yet.
+
+## Semantic retrieval (Story 2.3)
+
+Code: `src/building_with_rag/retrieval/semantic.py`, routed from `routes/query.py` for `pattern: "semantic"` only.
+
+Flow: validate request → scope filters → embed question → `$vectorSearch` → resolve chunk/section → `QueryResult`.
+
+- Validation: question trimmed (non-empty); `limit` 1–20; `SemanticFilters` forbids unknown fields and accepts only known plain strings (`BNS_2023`/`IPC_1860`, `in_force`/`repealed`, `public`). `caller_id` must be omitted or equal `WEBUI_DEMO_CALLER_ID`; `required_acts` and `chapter` are rejected (422). `generate_answer` is accepted but nothing is generated (noted in `trace.ignored`).
+- Scope: server fixes `access_level=["public"]`; caller `act`/`status` lists only narrow it (`$in` inside the `$vectorSearch` `filter`).
+- Embedding: raw question, `voyage-3.5`, `input_type="query"`, vector length must be 1,024.
+- Search: `vector_index` on `embeddings`, `numCandidates = max(limit, min(200, max(50, 10*limit)))`. Score order kept; chunks (not sections) returned. Hits whose chunk/section can't be resolved are omitted and counted in `trace.unresolved_hits`.
+- Outcomes: `ok` (passages), `no_results` (HTTP 200, filters match nothing; no score cutoff), 503 `retrieval_not_ready` (credentials, index, empty embeddings, dimension mismatch), 502 `retrieval_upstream_error` (Voyage/MongoDB failure, e.g. rate limit). Scores rank similarity only; they do not prove correctness.
+- New optional `RetrievedChunk` fields: `chunk_index`, `act_label`, `status`, `chapter`, `chapter_title`, `section_number`, `source_pdf`, `source_sha256`, `needs_review`.
+- Clients are created lazily with bounded timeouts; `/healthz` works without credentials.
+
+Diagnostic command (text truncated):
+
+```bash
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question": "What is the punishment for theft?", "pattern": "semantic", "limit": 3}' \
+  | jq '{status, trace, results: [.results[] | {chunk_id, section_id, act, heading, score, text: .text[:80]}]}'
+```
