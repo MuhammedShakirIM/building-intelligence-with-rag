@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     webui_demo_caller_id: str = "demo-public"
     generation_model_name: str = "gpt-4o-mini"
     rerank_api_base_url: str = "https://api.voyageai.com/v1"
+    rerank_api_key: str = ""
     rerank_model_name: str = "rerank-2.5"
     rerank_request_timeout_seconds: int = 30
     rerank_candidate_limit: int = 20

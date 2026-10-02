@@ -6,12 +6,14 @@ from building_with_rag.contracts import GenerationResult, QueryRequest, QueryRes
 from building_with_rag.generation.answer import Event, stream_answer
 from building_with_rag.registry import Pattern, run_pattern
 from building_with_rag.retrieval.hybrid import run_hybrid
+from building_with_rag.retrieval.rerank import run_hybrid_reranked
 from building_with_rag.retrieval.semantic import QueryError, run_semantic
 
 __all__ = ["REAL_PATTERNS", "QueryError", "answer_events", "attach_generation", "retrieve"]
 
 # Modes with real retrieval; they share one context -> generation -> validation path.
-REAL_PATTERNS = frozenset({Pattern.SEMANTIC.value, Pattern.HYBRID.value})
+REAL_PATTERNS = frozenset(
+    {Pattern.SEMANTIC.value, Pattern.HYBRID.value, Pattern.HYBRID_RERANKED.value})
 
 _OUTCOME_NOTE = {
     "answered": "Answer generated from the cited passages.",
@@ -26,11 +28,13 @@ _LOW_CONFIDENCE_NOTE = (
 
 
 def retrieve(request: QueryRequest) -> QueryResult:
-    """Semantic and hybrid run real retrieval; other modes use the shared placeholder dispatch."""
+    """Semantic, hybrid and hybrid-reranked run real retrieval; others use the placeholder."""
     if request.pattern is Pattern.SEMANTIC:
         return run_semantic(request)
     if request.pattern is Pattern.HYBRID:
         return run_hybrid(request)
+    if request.pattern is Pattern.HYBRID_RERANKED:
+        return run_hybrid_reranked(request)
     return QueryResult(**run_pattern(request.pattern, request.question, request.caller_id))
 
 

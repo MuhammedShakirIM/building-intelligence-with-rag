@@ -71,6 +71,10 @@ class RetrievedChunk(BaseModel):
     keyword_rank: int | None = None
     fused_score: float | None = None
     fused_rank: int | None = None
+    # Additive re-ranking evidence (Story 4.2); None outside hybrid-reranked or when not scored.
+    rerank_score: float | None = None
+    rerank_rank: int | None = None
+    omitted_reason: str | None = None
 
 
 class GenerationClaim(BaseModel):

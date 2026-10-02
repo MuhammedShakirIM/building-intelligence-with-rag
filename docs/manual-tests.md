@@ -48,10 +48,11 @@ Expected: `"status":"ok"` with fused results (real since Story 4.1; needs `chunk
 ```bash
 curl -s http://127.0.0.1:8000/v1/query \
   -H "Content-Type: application/json" \
-  -d '{"question": "What is theft?", "pattern": "hybrid-reranked"}'
+  -d '{"question": "What is theft?", "pattern": "hybrid-reranked", "limit": 3}' \
+  | jq '{status, t: .trace.rerank, r: [.results[] | {section_id, fr: .fused_rank, rr: .rerank_rank}]}'
 ```
 
-Expected: `"status":"not_implemented"`, message references `hybrid-reranked`.
+Expected: `"status":"ok"` with re-ranked results (real since Story 4.2; needs `RERANK_API_KEY`, else 503 `retrieval_not_ready`).
 
 ### Query — structured
 
@@ -98,7 +99,7 @@ Expected: 422 validation error (question below min_length 1).
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "rag-hybrid-reranked", "messages": [{"role": "user", "content": "What is theft?"}]}'
+  -d '{"model": "rag-structured", "messages": [{"role": "user", "content": "What is theft?"}]}'
 ```
 
 Expected: `"object":"chat.completion"`, `"finish_reason":"stop"`, content contains `not implemented yet`.
@@ -108,7 +109,7 @@ Expected: `"object":"chat.completion"`, `"finish_reason":"stop"`, content contai
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "rag-hybrid-reranked", "messages": [{"role": "user", "content": "What is theft?"}], "stream": true}'
+  -d '{"model": "rag-structured", "messages": [{"role": "user", "content": "What is theft?"}], "stream": true}'
 ```
 
 Expected: SSE `data:` frames with `delta` role then content, ending with `data: [DONE]`.
@@ -266,8 +267,28 @@ Expected: index ends `chunk_text_index: READY (queryable)`; `status: ok`, ≤ `l
 
 Compare modes: run one paraphrased and one exact-term question with `"pattern":"semantic"` and `"hybrid"`, `generate_answer: true`, `limit: 5`; note section order, contributing route(s), and `generation.outcome`.
 
-Chat: `rag-hybrid` streams DRAFT, confidence and `Sources:` as `rag-semantic` does; `rag-hybrid-reranked` still returns `not implemented yet`.
+Chat: `rag-hybrid` streams DRAFT, confidence and `Sources:` as `rag-semantic` does; `rag-structured` still returns `not implemented yet`.
 
 Failure: with `chunk_text_index` missing, hybrid → 503 `retrieval_not_ready` (names the keyword-index command) while semantic stays `ok`.
 
 Offline: `uv run pytest tests/test_hybrid_retrieval.py`
+
+## Story 4.2 — Hybrid re-ranking
+
+Prerequisite: Story 4.1 prerequisites plus `RERANK_API_KEY` in `.env`. Space Voyage runs ~25 s apart.
+
+```bash
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question":"What is the difference between culpable homicide and murder?","pattern":"hybrid-reranked","limit":5}' \
+  | jq '{status, t: .trace.rerank, r: [(.results[]|.+{kept:true}), (.omitted_candidates[]|.+{kept:false})] | map({section_id, kept, fr: .fused_rank, fs: .fused_score, rr: .rerank_rank, rs: .rerank_score, why: .omitted_reason, text: .text[:50]}) | sort_by(.fr)}'
+```
+
+Expected: `status: ok`; results ≤ `min(limit, RERANK_RETURN_LIMIT)` ordered by `rerank_rank`, `score == rerank_score`; omitted records carry `omitted_reason`; results + omitted = `trace.rerank.candidates`.
+
+Compare: run `hybrid` and `hybrid-reranked` with `generate_answer: true`, `limit: 5`; note section order (`fr → rr`), omitted IDs, `generation.outcome`, `trace.rerank.latency_ms`.
+
+Chat: `rag-hybrid-reranked` streams DRAFT, confidence and `Sources:`; cited chunks come from `results` only.
+
+Missing key: with `RERANK_API_KEY=` empty and the API restarted, `hybrid-reranked` → 503 `retrieval_not_ready` (query) / OpenAI-style error (chat); `hybrid` stays `ok`.
+
+Offline: `uv run pytest tests/test_rerank_retrieval.py tests/test_hybrid_retrieval.py`
