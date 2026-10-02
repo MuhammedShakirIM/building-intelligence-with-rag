@@ -153,3 +153,39 @@ uv run python scripts/extract_sections.py
 ```
 
 Expected: prints "BNS corpus up to date — skipping" and "IPC corpus up to date — skipping". No records appended or overwritten.
+
+## Story 2.3 — Semantic Retrieval
+
+What it adds: `pattern: "semantic"` on `POST /v1/query` embeds the question, runs a MongoDB vector search, and returns ranked source passages.
+
+Prerequisite: Story 2.2 ingestion done, `MONGODB_URI` and `VOYAGE_API_KEY` set in `.env`, API started as in Story 1.1.
+
+```bash
+# Success
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question": "What is the punishment for theft?", "pattern": "semantic", "limit": 3}' \
+  | jq '{status, trace, results: [.results[] | {chunk_id, section_id, act, heading, score, text: .text[:80]}]}'
+```
+
+Expected: `status: "ok"`, `pattern: "semantic"`, 1–3 results in non-increasing `score` order, populated `trace` (mode, embedding, index, limit, num_candidates, filters, result_count).
+
+```bash
+# No results (IPC is repealed, so the filters match nothing)
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question": "What is the punishment for theft?", "pattern": "semantic", "filters": {"act": ["IPC_1860"], "status": ["in_force"]}}' \
+  | jq '{status, message, results: (.results | length)}'
+```
+
+Expected: HTTP 200, `status: "no_results"`, 0 results.
+
+```bash
+# Rejected filter (operator-shaped value)
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question": "What is theft?", "pattern": "semantic", "filters": {"act": {"$ne": "x"}}}'
+
+# Rejected limit (max 20)
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question": "What is theft?", "pattern": "semantic", "limit": 21}'
+```
+
+Expected: `422` for each. With an empty `VOYAGE_API_KEY`, the success request returns HTTP 503 (`retrieval_not_ready`), not `no_results`.
