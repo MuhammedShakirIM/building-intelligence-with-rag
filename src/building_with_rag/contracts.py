@@ -132,6 +132,17 @@ class GenerationResult(BaseModel):
     low_confidence_reason: str = ""
 
 
+class SubquestionEvidence(BaseModel):
+    """One accepted decomposition subquestion with its own retrieved passages (Story 5.2)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    subquestion: str
+    status: Literal["evidenced", "insufficient"]
+    results: list[RetrievedChunk] = Field(default_factory=list)
+    reason: str | None = None
+
+
 class QueryResult(BaseModel):
     pattern: str
     status: str
@@ -141,7 +152,7 @@ class QueryResult(BaseModel):
     generation: GenerationResult | None = None
     # Additive, empty-by-default fields later modes use:
     omitted_candidates: list[RetrievedChunk] = Field(default_factory=list)
-    subquestions: list[str] = Field(default_factory=list)
+    subquestions: list[SubquestionEvidence] = Field(default_factory=list)
     hyde_direct_candidates: list[RetrievedChunk] = Field(default_factory=list)
     hyde_query_candidates: list[RetrievedChunk] = Field(default_factory=list)
     hyde_hypothetical_text_debug: str | None = None

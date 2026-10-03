@@ -42,7 +42,7 @@ One shared registry (single source of truth) holds only:
 | decomposition | `rag-decomposition` |
 | hyde | `rag-hyde` |
 
-`semantic` is real on `POST /v1/query` (Stories 2.3, 3.1) and on chat `rag-semantic` (Story 3.2); `hybrid` is real on both (Story 4.1); `hybrid-reranked` is real on both (Story 4.2); `structured` is real on both (Story 5.1). Every other mode returns an honest `not_implemented` placeholder on both until its own story adds behavior. The selected mode decides the route; there is no automatic routing or fallback between modes.
+`semantic` is real on `POST /v1/query` (Stories 2.3, 3.1) and on chat `rag-semantic` (Story 3.2); `hybrid` is real on both (Story 4.1); `hybrid-reranked` is real on both (Story 4.2); `structured` is real on both (Story 5.1). `decomposition` and `hyde` are real on both (Story 5.2). All six modes are real; `not_implemented` placeholders are no longer returned. The selected mode decides the route; there is no automatic routing or fallback between modes.
 
 ## API contracts
 
@@ -63,13 +63,17 @@ The classroom seed may resolve only its fixed local demo caller, but keeps `call
 
 - `pattern`, `status`, `message`, `trace`, `results`.
 - Optional `generation`.
-- `status` values: `ok`, `no_results`, `not_implemented`, and for `structured` (Story 5.1) `not_found`, `clarification_needed`, `recommendation`.
-- Additive empty-by-default fields later modes use: `omitted_candidates` (used by `hybrid-reranked` since Story 4.2: every candidate cut before or after re-ranking), `subquestions`, `hyde_direct_candidates`, `hyde_query_candidates`, `hyde_hypothetical_text_debug`.
+- `status` values: `ok`, `no_results`, `not_implemented` (no longer returned), for `structured` (Story 5.1) `not_found`, `clarification_needed`, `recommendation`, for `decomposition` (Story 5.2) `partial_answer`, `clarify`, and for `hyde` `hyde_unavailable`. `message` states in one line what ran and, for non-`ok`, why.
+- Additive empty-by-default fields later modes use: `omitted_candidates` (used by `hybrid-reranked` since Story 4.2: every candidate cut before or after re-ranking), `subquestions` (`list[SubquestionEvidence]`, Story 5.2), `hyde_direct_candidates`, `hyde_query_candidates`, `hyde_hypothetical_text_debug`.
 - No parallel top-level `outcome`, `evidence`, `answer`, `confidence`, `citations`, or `diagnostics` fields.
 
 ### `StructuredSignals` (Story 5.1)
 
 Pydantic, `extra="forbid"`, in `contracts.py`: `intent` (`exact_lookup`/`filter`/`aggregation`/None), `act` (`BNS_2023`/`IPC_1860`/None), `section_number` (1–999/None), `chapter`, `status` (`ok`/`recommendation`/`clarification_needed`), `reason`. `ok` only for a complete exact lookup.
+
+### `SubquestionEvidence` (Story 5.2)
+
+Pydantic, `extra="forbid"`, in `contracts.py`: `subquestion`, `status` (`evidenced`/`insufficient`), `results` (`RetrievedChunk` list), `reason` (None unless insufficient). Defined by this story (it did not exist earlier).
 
 ### `RetrievedChunk`
 
@@ -78,7 +82,7 @@ A retrieved passage is always this shape: `chunk_id`, `section_id`, `act`, `text
 ### Endpoints
 
 - `GET /healthz` — safe, no credentials required.
-- `POST /v1/query` — accepts `QueryRequest`, returns `QueryResult`; `semantic`, `hybrid`, `hybrid-reranked` and `structured` run real retrieval, other modes return placeholders via the shared `run_pattern` path.
+- `POST /v1/query` — accepts `QueryRequest`, returns `QueryResult`; all six modes run real retrieval (`run_pattern` is no longer reached).
 - `GET /v1/models` — lists the six `rag-<pattern>` model IDs.
 - `POST /v1/chat/completions` — OpenAI-compatible, text-only `ChatCompletionRequest`: `model`, `messages` with `system`/`developer`/`user`/`assistant` roles, `stream`, `n`, and optional strict `rag_options` (`pattern`, list filters, `limit`, `required_acts`, `chapter`).
 
@@ -237,7 +241,7 @@ curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
 
 ## Context and answer boundaries (Story 3.1)
 
-Code: `src/building_with_rag/generation/{context,answer}.py`, called from `routes/query.py` only for real modes (`semantic`, `hybrid`, `hybrid-reranked`, and `structured` when its status is `ok`) with `generate_answer: true`.
+Code: `src/building_with_rag/generation/{context,answer}.py`, called from `routes/query.py` only for real modes (`semantic`, `hybrid`, `hybrid-reranked`, `structured` and `hyde` when their status is `ok`, and `decomposition` when `ok` or `partial_answer`) with `generate_answer: true`.
 
 Flow: semantic `QueryResult` → bounded labelled context (`E1`…; at most 5 passages / 12,000 chars, never cut mid-passage) → one `POST {GENERATION_API_BASE_URL}/chat/completions` (`temperature: 0`, 30 s timeout, no retries) → strict JSON parse → citations resolved from the supplied context only.
 
@@ -270,3 +274,51 @@ Flow: scope check (`caller_id`; `required_acts` rejected; `chapter` accepted) �
 Errors: missing `MONGODB_URI` (only when a lookup is needed) → 503 `retrieval_not_ready`; MongoDB failure → 502 `retrieval_upstream_error`.
 
 Limitations: integer sections only (no `103A`); no multi-section or cross-act comparison; filter/aggregation recognised but not executed; IPC sections 4, 5, 18, 34, 40, 75, 161–165 are absent from `sections`; rule-based phrasing misses some wordings; a section over the 12,000-char context cap yields `insufficient_evidence` when answered (direct inspection still returns it).
+
+## Query decomposition (Story 5.2)
+
+Code: `retrieval/decomposition.py` (helpers in `retrieval/shared.py`). Selected only by `pattern: decomposition`; no routing, no fallback to a single-question search.
+
+Flow: `_check_scope` -> settings check (`GENERATION_API_BASE_URL`, `GENERATION_API_KEY`, `MONGODB_URI`, `VOYAGE_API_KEY`; missing -> 503 `retrieval_not_ready` naming it, before any call) -> one `_complete` decomposition call (no retry, no tools) -> pure validation -> one batched Voyage embedding -> one `$vectorSearch` per subquestion -> one sufficiency call -> assemble.
+
+Validation (`validate_subquestions`): strict JSON (fences stripped), no unknown keys, 1-3 items (`MAX_SUBQUESTIONS`), `text` 10-300 chars after whitespace normalization, `act` in `BNS_2023`/`IPC_1860`/null, no duplicates, each shares an alphabetic token of 4+ chars with the question. Any failure -> `clarify`, no embedding, never repaired.
+
+Retrieval: per-step `limit = min(request.limit, PER_STEP_LIMIT=2)`; filters = `effective_filters` plus the step `act` (intersected with `filters.act`; empty -> step `insufficient`, no search). Sufficiency sees up to 3 passages per step (heading + first 500 chars); a step with no passages is `insufficient` without asking. Invalid sufficiency reply -> `clarify` (`sufficiency check invalid`), passages retained.
+
+Outcomes: all steps evidenced `ok`; some `partial_answer` (message names unsupported subquestions); none `clarify`; no passages `no_results`. Provider failure -> 502 `retrieval_upstream_error`.
+
+Result: `subquestions` one per accepted step; `results` = deduplicated union, round-robin by step rank. Answers use only `evidenced` step passages (`answer_events` passes a shallow copy); insufficient passages stay in the response only. Chat prints `message` before the streamed text for `partial_answer`.
+
+Trace: `mode`, `query`, `embedding`, `filters`, `caller_id`, `result_count`, `decomposition` (`model`, `latency_ms`, `accepted`, `acts`, `rejected_reason`), `sufficiency` (`latency_ms`, `evidenced`, `insufficient`), `reason`.
+
+Diagnostic: `curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" -d '{"question":"<q>","pattern":"decomposition","generate_answer":true}' | jq '{status, reason: .trace.reason, t: (.trace | {decomposition, sufficiency}), s: [.subquestions[] | {subquestion, status, reason, ids: [.results[].section_id]}], g: (.generation | {outcome, confidence, text: .text[:200]})}'`
+
+## HyDE (Story 5.2)
+
+Code: `retrieval/hyde.py`. Selected only by `pattern: hyde`; a failed HyDE never degrades to semantic.
+
+Flow: `_check_scope` -> same settings check -> direct `run_semantic` (-> `hyde_direct_candidates`) -> one `_complete` call for a hypothetical statute-style passage (strict JSON `{"text": ...}`, non-empty, <= `MAX_HYPOTHETICAL_CHARS`=1,500; no retry) -> embed (`voyage-3.5`, 1,024, `input_type=document`) -> one `$vectorSearch` with the same filters and limit (-> `hyde_query_candidates`) -> merge.
+
+Merge: direct and HyDE candidates interleaved (direct first), deduplicated by `chunk_id` keeping the higher score, first `request.limit`. All results are real chunks; scores rank only.
+
+Outcomes: `ok`, `no_results`, `hyde_unavailable` (empty/malformed/oversized text: empty results and candidates, direct candidates not promoted). Provider failure -> 502.
+
+Boundary: the hypothetical text appears only in `hyde_hypothetical_text_debug` on `/v1/query`; never in `results`, `trace` (only `hypothetical_chars`), `message`, generation context, citations, chat or logs.
+
+Trace: `mode`, `query`, `embedding`, `filters`, `caller_id`, `result_count`, `hyde` (`model`, `latency_ms`, `hypothetical_chars`, `direct_count`, `hyde_count`, `overlap`, `final_from` `both`/`direct_only`/`hyde_only`).
+
+Diagnostic: `curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" -d '{"question":"<q>","pattern":"hyde","generate_answer":true}' | jq '{status, t: .trace.hyde, direct: [.hyde_direct_candidates[].section_id], hyde: [.hyde_query_candidates[].section_id], final: [.results[] | {section_id, score}], debug_chars: (.hyde_hypothetical_text_debug | length), g: (.generation | {outcome, confidence, text: .text[:200]})}'`
+
+Limitations (both modes): decomposition is one model pass (no iteration, no sub-sub-questions, 1-3 steps); sufficiency is a model judgment, not proof; per-step evidence is bounded (2 passages); the 5-passage/12,000-char answer context still applies; HyDE quality depends on the model's hypothetical and can drift; both add provider calls (latency, cost, Voyage rate limits), no retry, no fallback; no follow-up memory, automatic routing, graph retrieval or agentic loops; scores rank only; BNS/IPC source status is not current legal applicability.
+
+## Course smoke check
+
+Needs `.env`, the Story 4.1 keyword index and `RERANK_API_KEY`. One prepared question per mode, ~25 s apart:
+
+```bash
+q() { curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" -d "$1" \
+  | jq -c '{pattern, status, n: (.results|length), g: (.generation // {} | {outcome, confidence}), err: .detail.code}'; sleep 25; }
+# semantic, hybrid, hybrid-reranked, structured ("What does BNS section 103 say?"), decomposition, hyde; generate_answer true
+```
+
+Expect `status: ok`, `n >= 1`, `generation.outcome: answered`; `/v1/models` lists six IDs.

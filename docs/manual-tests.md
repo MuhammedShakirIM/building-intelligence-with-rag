@@ -2,7 +2,7 @@
 
 ## Story 1.1 — Architecture and Project Seed
 
-What it adds: FastAPI project seed with health, query, model-listing, and OpenAI-compatible chat endpoints — all returning honest `not_implemented` placeholders.
+What it adds: FastAPI project seed with health, query, model-listing, and OpenAI-compatible chat endpoints — originally all returning `not_implemented` placeholders (every mode is real since Story 5.2).
 
 Prerequisite: start the API — `uv run uvicorn building_with_rag.app:app --host 127.0.0.1 --port 8000`
 
@@ -54,25 +54,9 @@ curl -s http://127.0.0.1:8000/v1/query \
 
 Expected: `"status":"ok"` with re-ranked results (real since Story 4.2; needs `RERANK_API_KEY`, else 503 `retrieval_not_ready`).
 
-### Query — decomposition
+### Query — decomposition / hyde
 
-```bash
-curl -s http://127.0.0.1:8000/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What is theft?", "pattern": "decomposition"}'
-```
-
-Expected: `"status":"not_implemented"`, message references `decomposition`.
-
-### Query — hyde
-
-```bash
-curl -s http://127.0.0.1:8000/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What is theft?", "pattern": "hyde"}'
-```
-
-Expected: `"status":"not_implemented"`, message references `hyde`.
+Real since Story 5.2; see the Story 5.2 section (needs `.env` with generation settings).
 
 ### Query — empty question (failure)
 
@@ -89,17 +73,17 @@ Expected: 422 validation error (question below min_length 1).
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "rag-decomposition", "messages": [{"role": "user", "content": "What is theft?"}]}'
+  -d '{"model": "rag-structured", "messages": [{"role": "user", "content": "What does section 103 say?"}]}'
 ```
 
-Expected: `"object":"chat.completion"`, `"finish_reason":"stop"`, content contains `not implemented yet`.
+Expected: `"object":"chat.completion"`, `"finish_reason":"stop"`, content is the structured clarification (act is missing); no credentials or network needed.
 
 ### Chat completions — streaming
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "rag-decomposition", "messages": [{"role": "user", "content": "What is theft?"}], "stream": true}'
+  -d '{"model": "rag-structured", "messages": [{"role": "user", "content": "What does section 103 say?"}], "stream": true}'
 ```
 
 Expected: SSE `data:` frames with `delta` role then content, ending with `data: [DONE]`.
@@ -257,7 +241,7 @@ Expected: index ends `chunk_text_index: READY (queryable)`; `status: ok`, ≤ `l
 
 Compare modes: run one paraphrased and one exact-term question with `"pattern":"semantic"` and `"hybrid"`, `generate_answer: true`, `limit: 5`; note section order, contributing route(s), and `generation.outcome`.
 
-Chat: `rag-hybrid` streams DRAFT, confidence and `Sources:` as `rag-semantic` does; `rag-decomposition` still returns `not implemented yet`.
+Chat: `rag-hybrid` streams DRAFT, confidence and `Sources:` as `rag-semantic` does; `rag-decomposition` is real since Story 5.2.
 
 Failure: with `chunk_text_index` missing, hybrid → 503 `retrieval_not_ready` (names the keyword-index command) while semantic stays `ok`.
 
@@ -308,3 +292,24 @@ console.log(JSON.stringify({status: b.status, signals: b.trace.signals, mongodb_
 ```
 
 Offline: `uv run pytest tests/test_structured_retrieval.py tests/test_smoke.py`
+
+## Story 5.2 — Query decomposition and HyDE
+
+Prerequisite: `.env` with `MONGODB_URI`, `VOYAGE_API_KEY`, `GENERATION_API_BASE_URL`, `GENERATION_API_KEY`. Pause ~25 s between live calls.
+
+```bash
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question":"How does the BNS punishment for murder differ from the IPC punishment for murder?","pattern":"decomposition","generate_answer":true}' \
+  | jq '{status, reason: .trace.reason, t: (.trace | {decomposition, sufficiency}), s: [.subquestions[] | {subquestion, status, reason, ids: [.results[].section_id]}], g: (.generation | {outcome, confidence, text: .text[:200]})}'
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
+  -d '{"question":"What happens to someone who secretly takes a neighbour'"'"'s bike?","pattern":"hyde","generate_answer":true}' \
+  | jq '{status, t: .trace.hyde, direct: [.hyde_direct_candidates[].section_id], hyde: [.hyde_query_candidates[].section_id], final: [.results[] | {section_id, score}], debug_chars: (.hyde_hypothetical_text_debug | length), g: (.generation | {outcome, confidence, text: .text[:200]})}'
+```
+
+Expected: decomposition `ok` with 2 `evidenced` steps from both acts; a half with no corpus evidence gives `partial_answer` naming it; "What is theft?" gives `clarify` or one subquestion. HyDE `ok`, both candidate lists populated, `debug_chars > 0`, hypothetical text absent from `message`, `trace`, `generation` and chat.
+
+Missing config: with `GENERATION_API_KEY=` empty, both modes return 503 `retrieval_not_ready` naming it (chat: OpenAI-style envelope) while `semantic` stays `ok`.
+
+Chat: `rag-decomposition` / `rag-hyde` stream DRAFT, confidence and `Sources:`; `partial_answer` prints the unsupported-part message first.
+
+Offline: `uv run pytest tests/test_decomposition_hyde.py tests/test_smoke.py`

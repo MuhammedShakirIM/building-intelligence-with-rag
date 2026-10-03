@@ -5,7 +5,9 @@ from collections.abc import Iterator
 from building_with_rag.contracts import GenerationResult, QueryRequest, QueryResult
 from building_with_rag.generation.answer import Event, stream_answer
 from building_with_rag.registry import Pattern, run_pattern
+from building_with_rag.retrieval.decomposition import evidenced_results, run_decomposition
 from building_with_rag.retrieval.hybrid import run_hybrid
+from building_with_rag.retrieval.hyde import run_hyde
 from building_with_rag.retrieval.rerank import run_hybrid_reranked
 from building_with_rag.retrieval.semantic import QueryError, run_semantic
 from building_with_rag.retrieval.structured import run_structured
@@ -16,7 +18,7 @@ __all__ = ["REAL_PATTERNS", "QueryError", "answer_events", "attach_generation", 
 # Modes with real retrieval; they share one context -> generation -> validation path.
 REAL_PATTERNS = frozenset(
     {Pattern.SEMANTIC.value, Pattern.HYBRID.value, Pattern.HYBRID_RERANKED.value,
-     Pattern.STRUCTURED.value})
+     Pattern.STRUCTURED.value, Pattern.DECOMPOSITION.value, Pattern.HYDE.value})
 
 _OUTCOME_NOTE = {
     "answered": "Answer generated from the cited passages.",
@@ -31,7 +33,7 @@ _LOW_CONFIDENCE_NOTE = (
 
 
 def retrieve(request: QueryRequest) -> QueryResult:
-    """Semantic, hybrid, hybrid-reranked and structured run real retrieval; others are placeholders."""
+    """All six modes run real retrieval; the selected mode decides the route."""
     if request.pattern is Pattern.SEMANTIC:
         return run_semantic(request)
     if request.pattern is Pattern.HYBRID:
@@ -40,20 +42,30 @@ def retrieve(request: QueryRequest) -> QueryResult:
         return run_hybrid_reranked(request)
     if request.pattern is Pattern.STRUCTURED:
         return run_structured(request)
+    if request.pattern is Pattern.DECOMPOSITION:
+        return run_decomposition(request)
+    if request.pattern is Pattern.HYDE:
+        return run_hyde(request)
     return QueryResult(**run_pattern(request.pattern, request.question, request.caller_id))
 
 
 def has_answer_path(retrieval: QueryResult) -> bool:
-    """Real modes answer; structured only when it found the exact record (status ok)."""
-    if retrieval.pattern == Pattern.STRUCTURED.value:
+    """Real modes answer; structured/hyde only on ok, decomposition on ok or partial_answer."""
+    if retrieval.pattern in (Pattern.STRUCTURED.value, Pattern.HYDE.value):
         return retrieval.status == "ok"
+    if retrieval.pattern == Pattern.DECOMPOSITION.value:
+        return retrieval.status in {"ok", "partial_answer"}
     return retrieval.pattern in REAL_PATTERNS
 
 
 def answer_events(question: str, retrieval: QueryResult) -> Iterator[Event]:
     """The single generation/validation operation; no events for placeholder modes."""
-    if has_answer_path(retrieval):
-        yield from stream_answer(question, retrieval)
+    if not has_answer_path(retrieval):
+        return
+    if retrieval.pattern == Pattern.DECOMPOSITION.value:
+        # Only passages of evidenced steps reach the answer context.
+        retrieval = retrieval.model_copy(update={"results": evidenced_results(retrieval)})
+    yield from stream_answer(question, retrieval)
 
 
 def attach_generation(question: str, result: QueryResult) -> QueryResult:

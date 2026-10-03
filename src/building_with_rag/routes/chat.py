@@ -118,6 +118,9 @@ def _pieces(question: str, result: QueryResult) -> Iterator[str]:
         return
     final: GenerationResult | None = None
     had_text = False
+    if result.status == "partial_answer":
+        yield result.message + "\n\n"
+        had_text = True
     for event in answer_events(question, result):
         if event.kind == "final":
             final = event.result
