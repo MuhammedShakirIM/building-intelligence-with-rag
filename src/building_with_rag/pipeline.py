@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from building_with_rag.contracts import GenerationResult, QueryRequest, QueryResult
 from building_with_rag.generation.answer import Event, stream_answer
 from building_with_rag.registry import Pattern, run_pattern
+from building_with_rag.retrieval.agentic import run_agentic
 from building_with_rag.retrieval.decomposition import evidenced_results, run_decomposition
 from building_with_rag.retrieval.hybrid import run_hybrid
 from building_with_rag.retrieval.hyde import run_hyde
@@ -18,7 +19,8 @@ __all__ = ["REAL_PATTERNS", "QueryError", "answer_events", "attach_generation", 
 # Modes with real retrieval; they share one context -> generation -> validation path.
 REAL_PATTERNS = frozenset(
     {Pattern.SEMANTIC.value, Pattern.HYBRID.value, Pattern.HYBRID_RERANKED.value,
-     Pattern.STRUCTURED.value, Pattern.DECOMPOSITION.value, Pattern.HYDE.value})
+     Pattern.STRUCTURED.value, Pattern.DECOMPOSITION.value, Pattern.HYDE.value,
+     Pattern.AGENTIC.value})
 
 _OUTCOME_NOTE = {
     "answered": "Answer generated from the cited passages.",
@@ -33,7 +35,7 @@ _LOW_CONFIDENCE_NOTE = (
 
 
 def retrieve(request: QueryRequest) -> QueryResult:
-    """All six modes run real retrieval; the selected mode decides the route."""
+    """All seven modes run real retrieval; the selected mode decides the route."""
     if request.pattern is Pattern.SEMANTIC:
         return run_semantic(request)
     if request.pattern is Pattern.HYBRID:
@@ -46,13 +48,18 @@ def retrieve(request: QueryRequest) -> QueryResult:
         return run_decomposition(request)
     if request.pattern is Pattern.HYDE:
         return run_hyde(request)
+    if request.pattern is Pattern.AGENTIC:
+        return run_agentic(request)
     return QueryResult(**run_pattern(request.pattern, request.question, request.caller_id))
 
 
 def has_answer_path(retrieval: QueryResult) -> bool:
-    """Real modes answer; structured/hyde only on ok, decomposition on ok or partial_answer."""
+    """Real modes answer; structured/hyde only on ok, decomposition on ok or partial_answer,
+    agentic only on ready_for_synthesis."""
     if retrieval.pattern in (Pattern.STRUCTURED.value, Pattern.HYDE.value):
         return retrieval.status == "ok"
+    if retrieval.pattern == Pattern.AGENTIC.value:
+        return retrieval.status == "ready_for_synthesis"
     if retrieval.pattern == Pattern.DECOMPOSITION.value:
         return retrieval.status in {"ok", "partial_answer"}
     return retrieval.pattern in REAL_PATTERNS

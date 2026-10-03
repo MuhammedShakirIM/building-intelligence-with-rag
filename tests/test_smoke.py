@@ -19,16 +19,17 @@ def test_healthz(client: TestClient) -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_query_request_accepts_all_six_patterns() -> None:
+def test_query_request_accepts_all_seven_patterns() -> None:
+    assert len(PATTERN_MODEL_IDS) == 7
     for pattern in PATTERN_MODEL_IDS:
         assert QueryRequest(question="What is theft?", pattern=pattern).pattern is pattern
 
 
-def test_models_lists_six(client: TestClient) -> None:
+def test_models_lists_seven(client: TestClient) -> None:
     response = client.get("/v1/models")
     assert response.status_code == 200
     ids = [m["id"] for m in response.json()["data"]]
-    assert len(ids) == 6 and ids == list(PATTERN_MODEL_IDS.values())
+    assert len(ids) == 7 and ids == list(PATTERN_MODEL_IDS.values())
 
 
 def test_chat_json_clarification(client: TestClient) -> None:

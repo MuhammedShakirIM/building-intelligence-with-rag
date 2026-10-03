@@ -313,3 +313,33 @@ Missing config: with `GENERATION_API_KEY=` empty, both modes return 503 `retriev
 Chat: `rag-decomposition` / `rag-hyde` stream DRAFT, confidence and `Sources:`; `partial_answer` prints the unsupported-part message first.
 
 Offline: `uv run pytest tests/test_decomposition_hyde.py tests/test_smoke.py`
+
+## Story 6.1 — Bounded agentic RAG
+
+Prerequisite: `.env` with `MONGODB_URI`, `VOYAGE_API_KEY`, `GENERATION_API_BASE_URL`, `GENERATION_API_KEY`; optional `AGENTIC_DEADLINE_SECONDS` (default 20, valid 1-120; invalid -> 503 `retrieval_not_ready`). Pause ~25 s between live calls.
+
+Postman: Import → Raw text → paste one curl (no shell functions or pipes). Each is a plain single-line curl; `\u0027` is a JSON-escaped apostrophe (keeps the single-quoted shell string valid).
+
+```bash
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" -d '{"question":"What does BNS section 103 say?","pattern":"agentic","generate_answer":true}'
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" -d '{"question":"What does IPC section 4 say?","pattern":"agentic"}'
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" -d '{"question":"What is the punishment for theft?","pattern":"agentic","generate_answer":true}'
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" -d '{"question":"What happens to someone who secretly takes a neighbour\u0027s bike?","pattern":"agentic","generate_answer":true}'
+curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" -d '{"question":"section 103","pattern":"agentic"}'
+curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"rag-agentic","messages":[{"role":"user","content":"What is the punishment for theft?"}]}'
+```
+
+Expected, in order: `ready_for_synthesis`, `path: exact_lookup`, `call_count: 1`, `bns:103`; `partial_result`, `record_not_found`, empty `results`; `ready_for_synthesis`, `path: semantic`, `generation.outcome: answered`; `path: vocab_mismatch` (`hyde_calls: 1` only if the direct step was inadequate; `hyde_hypothetical_text_debug: null`); `clarify`, `bare_section_number`, `call_count: 0`, empty `steps`; chat content with DRAFT, `Evidence check passed — confidence: high` and `Sources:` (omit `stream` for one JSON reply; add `Authorization: Bearer <key>` if `CAPSTONE_API_KEY` is set).
+
+Compact view: paste in **Scripts → Post-response** and read the Console (query requests only):
+
+```js
+const b = pm.response.json();
+console.log(JSON.stringify({status: b.status, path: b.trace.path, stop: b.trace.stop_reason, calls: b.trace.call_count, hyde: b.trace.hyde_calls,
+  steps: (b.trace.steps || []).map(s => [s.adapter, s.tool_status, s.adequate]), ids: b.results.map(r => r.section_id),
+  dbg: b.hyde_hypothetical_text_debug, g: b.generation ? {o: b.generation.outcome, c: b.generation.confidence, n: b.generation.citations.length} : null}));
+```
+
+Chat: `rag-agentic` streams DRAFT text, `Evidence check passed — confidence: high` and `Sources:`; non-answer statuses print `message` only.
+
+Offline: `uv run pytest tests/test_smoke.py`

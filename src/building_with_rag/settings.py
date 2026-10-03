@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     rerank_candidate_limit: int = 20
     rerank_send_limit: int = 10
     rerank_return_limit: int = 5
+    # Story 6.1: kept as text so an invalid value gives a 503 naming it, not a startup crash.
+    agentic_deadline_seconds: str | int = "20"
 
 
 def get_settings() -> Settings:

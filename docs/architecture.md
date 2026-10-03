@@ -41,15 +41,16 @@ One shared registry (single source of truth) holds only:
 | structured | `rag-structured` |
 | decomposition | `rag-decomposition` |
 | hyde | `rag-hyde` |
+| agentic | `rag-agentic` |
 
-`semantic` is real on `POST /v1/query` (Stories 2.3, 3.1) and on chat `rag-semantic` (Story 3.2); `hybrid` is real on both (Story 4.1); `hybrid-reranked` is real on both (Story 4.2); `structured` is real on both (Story 5.1). `decomposition` and `hyde` are real on both (Story 5.2). All six modes are real; `not_implemented` placeholders are no longer returned. The selected mode decides the route; there is no automatic routing or fallback between modes.
+`semantic` is real on `POST /v1/query` (Stories 2.3, 3.1) and on chat `rag-semantic` (Story 3.2); `hybrid` is real on both (Story 4.1); `hybrid-reranked` is real on both (Story 4.2); `structured` is real on both (Story 5.1). `decomposition` and `hyde` are real on both (Story 5.2). `agentic` is real on both (Story 6.1). All seven modes are real; `not_implemented` placeholders are no longer returned. The selected mode decides the route; there is no automatic routing or fallback between modes.
 
 ## API contracts
 
 ### `QueryRequest` (`POST /v1/query`)
 
 - `question`: string, 1–4,000 characters, required.
-- `pattern`: one of the six modes.
+- `pattern`: one of the seven modes.
 - `caller_id`: optional.
 - `filters`: optional `SemanticFilters` — `act`, `status`, `access_level`, each a list.
 - `limit`: default 5, range 1–20.
@@ -63,7 +64,7 @@ The classroom seed may resolve only its fixed local demo caller, but keeps `call
 
 - `pattern`, `status`, `message`, `trace`, `results`.
 - Optional `generation`.
-- `status` values: `ok`, `no_results`, `not_implemented` (no longer returned), for `structured` (Story 5.1) `not_found`, `clarification_needed`, `recommendation`, for `decomposition` (Story 5.2) `partial_answer`, `clarify`, and for `hyde` `hyde_unavailable`. `message` states in one line what ran and, for non-`ok`, why.
+- `status` values: `ok`, `no_results`, `not_implemented` (no longer returned), for `structured` (Story 5.1) `not_found`, `clarification_needed`, `recommendation`, for `decomposition` (Story 5.2) `partial_answer`, `clarify`, for `hyde` `hyde_unavailable`, and for `agentic` (Story 6.1) `ready_for_synthesis`, `partial_result` and `clarify`. `message` states in one line what ran and, for non-`ok`, why.
 - Additive empty-by-default fields later modes use: `omitted_candidates` (used by `hybrid-reranked` since Story 4.2: every candidate cut before or after re-ranking), `subquestions` (`list[SubquestionEvidence]`, Story 5.2), `hyde_direct_candidates`, `hyde_query_candidates`, `hyde_hypothetical_text_debug`.
 - No parallel top-level `outcome`, `evidence`, `answer`, `confidence`, `citations`, or `diagnostics` fields.
 
@@ -82,8 +83,8 @@ A retrieved passage is always this shape: `chunk_id`, `section_id`, `act`, `text
 ### Endpoints
 
 - `GET /healthz` — safe, no credentials required.
-- `POST /v1/query` — accepts `QueryRequest`, returns `QueryResult`; all six modes run real retrieval (`run_pattern` is no longer reached).
-- `GET /v1/models` — lists the six `rag-<pattern>` model IDs.
+- `POST /v1/query` — accepts `QueryRequest`, returns `QueryResult`; all seven modes run real retrieval (`run_pattern` is no longer reached).
+- `GET /v1/models` — lists the seven `rag-<pattern>` model IDs.
 - `POST /v1/chat/completions` — OpenAI-compatible, text-only `ChatCompletionRequest`: `model`, `messages` with `system`/`developer`/`user`/`assistant` roles, `stream`, `n`, and optional strict `rag_options` (`pattern`, list filters, `limit`, `required_acts`, `chapter`).
 
 The chat adapter maps the selected model to the same `QueryRequest` and the shared `pipeline.retrieve` + `answer_events` path as `/v1/query`; it sets server-side demo `caller_id` and `generate_answer`. Supports normal OpenAI Chat Completions JSON responses and role/content/stop frames, plus the OpenAI-style error envelope before streaming begins. `rag_options` accepts flat `act`/`status` and the Pipe's nested `filters.{act,status}`. When `CAPSTONE_API_KEY` is non-empty, chat requires `Authorization: Bearer <key>` (constant-time compare, else 401 `invalid_api_key`); other endpoints are unchanged. No custom SSE events.
@@ -100,6 +101,7 @@ The trainer-supplied Open WebUI bundle is the chat client, run separately from t
 - The application must start with no database or model credentials and expose a safe `GET /healthz`.
 - Canonical environment values are defined in `.env.example`.
 - `RERANK_API_KEY` (empty by default) is required only by `hybrid-reranked`; see "Re-ranking (Story 4.2)".
+- `AGENTIC_DEADLINE_SECONDS` (default `20`, valid 1-120) is the cooperative deadline of `agentic`; invalid -> 503 `retrieval_not_ready` naming it. Not a provider variable.
 
 ## Corpus
 
@@ -241,7 +243,7 @@ curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" \
 
 ## Context and answer boundaries (Story 3.1)
 
-Code: `src/building_with_rag/generation/{context,answer}.py`, called from `routes/query.py` only for real modes (`semantic`, `hybrid`, `hybrid-reranked`, `structured` and `hyde` when their status is `ok`, and `decomposition` when `ok` or `partial_answer`) with `generate_answer: true`.
+Code: `src/building_with_rag/generation/{context,answer}.py`, called from `routes/query.py` only for real modes (`semantic`, `hybrid`, `hybrid-reranked`, `structured` and `hyde` when their status is `ok`, and `decomposition` when `ok` or `partial_answer`, and `agentic` when `ready_for_synthesis`) with `generate_answer: true`.
 
 Flow: semantic `QueryResult` → bounded labelled context (`E1`…; at most 5 passages / 12,000 chars, never cut mid-passage) → one `POST {GENERATION_API_BASE_URL}/chat/completions` (`temperature: 0`, 30 s timeout, no retries) → strict JSON parse → citations resolved from the supplied context only.
 
@@ -309,7 +311,29 @@ Trace: `mode`, `query`, `embedding`, `filters`, `caller_id`, `result_count`, `hy
 
 Diagnostic: `curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" -d '{"question":"<q>","pattern":"hyde","generate_answer":true}' | jq '{status, t: .trace.hyde, direct: [.hyde_direct_candidates[].section_id], hyde: [.hyde_query_candidates[].section_id], final: [.results[] | {section_id, score}], debug_chars: (.hyde_hypothetical_text_debug | length), g: (.generation | {outcome, confidence, text: .text[:200]})}'`
 
-Limitations (both modes): decomposition is one model pass (no iteration, no sub-sub-questions, 1-3 steps); sufficiency is a model judgment, not proof; per-step evidence is bounded (2 passages); the 5-passage/12,000-char answer context still applies; HyDE quality depends on the model's hypothetical and can drift; both add provider calls (latency, cost, Voyage rate limits), no retry, no fallback; no follow-up memory, automatic routing, graph retrieval or agentic loops; scores rank only; BNS/IPC source status is not current legal applicability.
+Limitations (both modes): decomposition is one model pass (no iteration, no sub-sub-questions, 1-3 steps); sufficiency is a model judgment, not proof; per-step evidence is bounded (2 passages); the 5-passage/12,000-char answer context still applies; HyDE quality depends on the model's hypothetical and can drift; both add provider calls (latency, cost, Voyage rate limits), no retry, no fallback; no follow-up memory, automatic routing, graph retrieval or agentic loops (the bounded fixed controller is in "Agentic RAG (Story 6.1)"); scores rank only; BNS/IPC source status is not current legal applicability.
+
+## Agentic RAG (Story 6.1)
+
+Code: `retrieval/agentic.py`. Selected only by `pattern: agentic` (`rag-agentic`); it never routes other modes and no mode falls back to it. A fixed, deterministic, read-only controller, not an LLM planner or loop: validate -> one of three fixed paths -> at most two allowlisted adapter calls -> inspect each result -> stop with a traced reason.
+
+Allowlist (constant): `structuredLookup` -> `run_structured`, `semanticRetrieve` -> `run_semantic`, `hydeRetrieve` -> `run_hyde`. Each call uses `request.model_copy(update={"pattern": ...})`, so `caller_id`, `filters`, `limit` and the server-fixed `access_level=["public"]` propagate. Scope check first: invalid `caller_id` -> 422; `required_acts`/`chapter` -> 422 `unsupported_option`.
+
+Validation (pure, before any call; `structured.classify` for section detection; trace keeps a fixed `reason_code`, never the question): `clarify` for `bare_section_number`, `act_missing`, `both_acts`, `several_sections`, `section_out_of_range`, `listing_or_count`, `act_filter_conflict`, `too_short` (< 3 alphabetic words and not an act-qualified section request); otherwise valid.
+
+Fixed rules, in order: (1) act-qualified section request -> one `structuredLookup`; adequate only with one usable passage matching the classified act and section; `not_found` -> `partial_result` (`record_not_found`, empty results); never guesses or falls back. (2) A whole-word `LAY_TERMS` term (`bike`, `scooter`, `swindle`, `scam`, `beat up`, `break into`, `mobile phone`) -> `semanticRetrieve`; adequate only if a usable passage's heading/text contains the term, else one `hydeRetrieve` (adequate = any usable passage). Retained evidence is the last adequate call's `results` only. (3) Otherwise one `semanticRetrieve`.
+
+Adequacy: a usable passage has non-empty `chunk_id`, `section_id`, non-blank `text` and `act` in `BNS_2023`/`IPC_1860`; adequate = at least one. A passage outside the effective `act`/`status` filters, or more results than `limit`, is `tool_result_invalid`. The controller never re-ranks, edits, merges or dedupes results.
+
+Outcomes: `ready_for_synthesis` (adequate; answer path runs), `partial_result` (valid request, no adequate evidence or a stop condition; usable passages already returned, may be empty; no model call), `clarify` (validation or adapter clarification; empty results; no model call). Stop reasons: `evidence_adequate`, `no_usable_evidence`, `record_not_found`, `needs_clarification`, `tool_unavailable` (adapter `QueryError` or `hyde_unavailable`; HTTP code only), `tool_result_invalid`, `deadline_expired`, `budget_exhausted`. Adapter failures give `partial_result` (HTTP 200), not 502/503. Budget: <= 2 calls, <= 1 `hydeRetrieve`, guarded before every call. Deadline (`AGENTIC_DEADLINE_SECONDS`): monotonic clock checked before each call and after (a late result is discarded, not inspected).
+
+Boundaries: only `results` are copied from adapters; the HyDE hypothetical text, adapter `trace` (holds the question), and the `hyde_*` fields never enter the output. `message` is fixed and never echoes the question. Logs hold only exception types.
+
+Trace: `mode`, `caller_id`, `filters`, `limit`, `validation` (`outcome`, `reason_code`), `path` (`clarify`|`exact_lookup`|`semantic`|`vocab_mismatch`), `steps` (`n`, `adapter`, `tool_status`, `returned`, `usable`, `adequate`, `ms`), `call_count`, `hyde_calls`, `deadline_seconds`, `elapsed_ms`, `stop_reason`, `result_count`.
+
+Diagnostic: `curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" -d '{"question":"<q>","pattern":"agentic","generate_answer":true}' | jq '{status, t: .trace, r: [.results[] | {section_id, score}], dbg: (.hyde_hypothetical_text_debug), hc: (.hyde_query_candidates|length), g: (.generation // {} | {outcome, confidence, c: (.citations|length), text: .text[:150]})}'`
+
+Limitations: a fixed deterministic controller, not a planner or loop; at most 2 calls / 1 HyDE; the `hydeRetrieve` adapter runs its own direct semantic search inside its one call; `LAY_TERMS` is a small fixed table and misses other lay wording; adequacy means "a real passage exists", not "answers the question"; the deadline is cooperative (one in-flight call keeps its own timeout); no memory, automatic routing, GraphRAG, writes or retries; BNS/IPC status is not current legal applicability.
 
 ## Course smoke check
 
@@ -318,7 +342,7 @@ Needs `.env`, the Story 4.1 keyword index and `RERANK_API_KEY`. One prepared que
 ```bash
 q() { curl -s http://127.0.0.1:8000/v1/query -H "Content-Type: application/json" -d "$1" \
   | jq -c '{pattern, status, n: (.results|length), g: (.generation // {} | {outcome, confidence}), err: .detail.code}'; sleep 25; }
-# semantic, hybrid, hybrid-reranked, structured ("What does BNS section 103 say?"), decomposition, hyde; generate_answer true
+# semantic, hybrid, hybrid-reranked, structured ("What does BNS section 103 say?"), decomposition, hyde, agentic; generate_answer true
 ```
 
-Expect `status: ok`, `n >= 1`, `generation.outcome: answered`; `/v1/models` lists six IDs.
+Expect `status: ok`, `n >= 1`, `generation.outcome: answered`; `agentic` gives `ready_for_synthesis`; `/v1/models` lists seven IDs.

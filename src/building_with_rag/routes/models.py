@@ -1,4 +1,4 @@
-"""Model listing: the six rag-<pattern> model IDs."""
+"""Model listing: the seven rag-<pattern> model IDs."""
 
 from fastapi import APIRouter
 
