@@ -25,6 +25,8 @@ Record the detected version and capability in the handover. Do not fall back to 
 
 ## Work to do
 
+**Do not execute the ingestion runner, and do not call Voyage or write to MongoDB.** Write the code only. The developer runs it (see "Developer runs this"). Adding the dependencies with `uv add` is allowed; running `ingest` is not.
+
 ### 1. Dependencies
 
 ```bash
@@ -120,21 +122,30 @@ Add or rewrite a section after "Corpus" (replace any earlier MongoDB section so 
 
 Unchanged: `.env.example`, `settings.py`, `contracts.py` (`RetrievedChunk`, `QueryRequest`, `QueryResult`), `registry.py`, `routes/`. No new endpoints. Later stories query `embeddings` with `$vectorSearch`, resolve each `chunk_id` to `chunks` and `sections`, and produce `RetrievedChunk` results.
 
-## Completion checks (lightweight)
+## Completion checks (code only — no database or Voyage calls)
 
-1. Prerequisite check passes, or stops with its exact message.
-2. `uv run python -m building_with_rag.ingestion.ingest` completes.
-3. Collections exist: `sources` = 2, `sections` = corpus total (858 with the supplied PDFs), `chunks` > 0, `embeddings` = `chunks`.
-4. `bns:1` has one or more chunks with `section_id == "bns:1"`; a sampled vector has length 1,024.
-5. `vector_index` is `READY`, or its last-known status is reported.
-6. Sample `$vectorSearch` prints `chunk_id`, `section_id`, heading, and score — or reports pending.
-7. A second run skips everything and embeds nothing.
-8. `uv run ruff check src/building_with_rag/ingestion` passes.
+1. `uv run python -c "import building_with_rag.ingestion.ingest"` succeeds (module imports cleanly).
+2. Constants in `mongodb_schema.py` match this story exactly (collection names, `vector_index`, `v1`, 2048/256, `voyage-3.5`, 1024, `public`).
+3. The vector index definition is `type="vectorSearch"` with the `fields` array above — no `mappings`/`knnVector`.
+4. Deterministic ID helpers produce the documented 24-character formulas.
+5. The runner's prerequisite check, re-run (skip/replace) logic, batching with pauses, and 429 retry are all present in the code.
+6. `uv run ruff check src/building_with_rag/ingestion` passes.
 
 Run only checks specific to this story; do not run the full test suite.
 
+## Developer runs this (not the implementer)
+
+The developer executes these and confirms the results. Expect ~35–40 minutes on a free Voyage key.
+
+1. `uv run python -m building_with_rag.ingestion.ingest` completes.
+2. Collections: `sources` = 2, `sections` = corpus total (858 with the supplied PDFs), `chunks` > 0, `embeddings` = `chunks`.
+3. `bns:1` has one or more chunks with `section_id == "bns:1"`; a sampled vector has length 1,024.
+4. `vector_index` is `READY`, or its last-known status is reported.
+5. Sample `$vectorSearch` prints `chunk_id`, `section_id`, heading, and score — or reports pending.
+6. A second run skips everything and embeds nothing.
+
 ## Handover
 
-Record: files created or changed; commands run (`uv add ...`, ingestion, re-run); MongoDB version and Atlas capability detected; chunk and embedding counts; results of the verification checks above (link, dimension, re-run, index status, sample query); and the updated architecture section.
+Record: files created or changed; dependency versions resolved by `uv add`; results of the code-only completion checks; and the updated architecture section. Leave the counts, MongoDB version, index status, and sample-query result blank for the developer to fill after they run the ingestion. State plainly that the ingestion was not executed.
 
 Story report (per project instructions): `Completed.`, changed paths, test results — at most 7 lines, ending with the full-suite command (`uv run pytest`) for the developer to run if wanted.
