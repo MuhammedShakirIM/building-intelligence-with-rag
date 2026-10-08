@@ -1,3 +1,5 @@
+@AGENTS.md
+
 # Project instructions
 
 This is a shared training capstone; token waste multiplies across 20+ users.
